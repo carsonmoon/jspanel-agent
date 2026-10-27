@@ -1217,16 +1217,12 @@ async fn restart_realm() {
 
 async fn relay_apply(body: String, desired_running: bool, hash: &str) -> Result<()> {
     if body.is_empty() {
-        // 开关开着但渲染为空：与 hub 侧语义对齐——写占位待命而不是停服务
-        // 删文件（此前推空一刀切，realm 莫名停摆；隧道实测 #3）。
+        // 空配置的语义唯一：desired_running=false，停服务清文件。「空体+true」
+        // 曾是 hub 侧语义分叉的遗物——本侧自造占位写盘，指纹与空期望永不相等，
+        // 每 60s 心跳重推并重启 realm；占位的定义与下发已收归 hub 独占
+        // （relay_expected，2026-10-27 收口），此组合成为协议错误。
         if desired_running {
-            let placeholder = "# monitor 待命占位：无中转规则，仅本机可达，不会收到流量\n[network]\nno_tcp = false\nuse_udp = true\n\n[[endpoints]]\nlisten = \"127.0.0.1:19998\"\nremote = \"127.0.0.1:9\"\n";
-            let hash = hex(&Sha256::digest(placeholder.as_bytes()));
-            tokio::fs::create_dir_all(realm_config().parent().expect("parent")).await?;
-            tokio::fs::write(realm_config(), placeholder).await?;
-            std::fs::write(realm_config().with_extension("toml.hash"), &hash)?;
-            restart_realm().await;
-            return Ok(());
+            bail!("空配置必须带 desired_running=false（期望停服务清理）；占位待命由 hub 以显式配置下发");
         }
         if systemd() {
             let _ = run_cmd("systemctl", &["stop", "monitor-realm@main"]).await;
@@ -1458,6 +1454,30 @@ async fn mini_socks5(listener: tokio::net::TcpListener) {
 
 #[cfg(test)]
 mod tests {
+    /// 空配置语义唯一性：desired_running=false 才是合法组合（停服务清文件）；
+    /// true 是 hub 侧语义分叉遗物，现为协议错误。MONITOR_PROXY_DIR 隔离文件
+    /// 落点，其余测试不读该变量、无并行干扰。
+    #[tokio::test]
+    async fn empty_relay_config_must_carry_desired_off() {
+        let dir = std::env::temp_dir().join(format!("monitor-agent-relay-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::env::set_var("MONITOR_PROXY_DIR", &dir);
+        std::fs::create_dir_all(realm_config().parent().unwrap()).unwrap();
+        std::fs::write(realm_config(), "old-config").unwrap();
+        std::fs::write(realm_config().with_extension("toml.hash"), "old-hash").unwrap();
+
+        let err = relay_apply(String::new(), true, "").await.unwrap_err();
+        assert!(err.to_string().contains("desired_running"), "空体+true 是协议错误: {err}");
+        assert!(realm_config().exists(), "协议错误不碰盘上文件");
+
+        relay_apply(String::new(), false, "").await.unwrap();
+        assert!(!realm_config().exists(), "合法语义：配置文件清除");
+        assert!(!realm_config().with_extension("toml.hash").exists(), "指纹文件清除");
+
+        std::env::remove_var("MONITOR_PROXY_DIR");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     use super::*;
 
     /// http_probe 经 socks5 出口链访问目标：真实拨号链路（本机→socks5→目标）。
