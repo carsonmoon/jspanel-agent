@@ -1535,6 +1535,49 @@ mod tests {
         buf
     }
 
+    /// 架构巡检批次4：与 hub 的 golden_fixture_decodes_identically_across_repos
+    /// 共享同一份 src/testdata/singbox-events.golden 与同一个 sha 常量——两仓
+    /// 解码器对同一字节必须解出同一事件序列（协议知识单一事实源，夹具改动
+    /// 必须两仓同步并同步换常量）。
+    #[test]
+    fn golden_fixture_decodes_identically_across_repos() {
+        const GOLDEN_SHA: &str = "94870bb2c541976ad13a9357bf029bbbcb1d1c0c4dbd48a7f82de3a3f7864791";
+        let golden = include_bytes!("testdata/singbox-events.golden");
+        use sha2::{Digest, Sha256};
+        assert_eq!(
+            hex::encode(Sha256::digest(golden)),
+            GOLDEN_SHA,
+            "golden 夹具与两仓共享版本不一致：任何一侧改动都要同步另一侧"
+        );
+
+        let mut rest = &golden[..];
+        let mut events = Vec::new();
+        while !rest.is_empty() {
+            let n = rest[0] as usize;
+            events.push(decode_connection_event(&rest[1..1 + n]).expect("golden 帧必须可解码"));
+            rest = &rest[1 + n..];
+        }
+        assert_eq!(events.len(), 3);
+        match &events[0] {
+            ConnEvent::New { id, user, inbound, network, source, destination, domain } => {
+                assert_eq!(
+                    (id.as_str(), user.as_str(), inbound.as_str(), network.as_str()),
+                    ("conn-1", "alice", "in-11990", "udp")
+                );
+                assert_eq!(
+                    (source.as_str(), destination.as_str(), domain.as_str()),
+                    ("1.2.3.4:5", "example.com:443", "example.com")
+                );
+            }
+            other => panic!("第一帧应为 NEW：{other:?}"),
+        }
+        assert_eq!(
+            events[1],
+            ConnEvent::Update { id: "e0a2d363-617b-47be-9aca-bbcd376e53ad".into(), up: 1570, down: 0 }
+        );
+        assert_eq!(events[2], ConnEvent::Closed { id: "c1".into(), up: 111, down: 222 });
+    }
+
     #[test]
     fn a_closed_event_with_final_deltas_decodes_both() {
         // CLOSED { id: "c1", uplinkDelta: 111, downlinkDelta: 222 }
