@@ -1545,7 +1545,7 @@ mod tests {
         let golden = include_bytes!("testdata/singbox-events.golden");
         use sha2::{Digest, Sha256};
         assert_eq!(
-            hex::encode(Sha256::digest(golden)),
+            hex(&Sha256::digest(golden)),
             GOLDEN_SHA,
             "golden 夹具与两仓共享版本不一致：任何一侧改动都要同步另一侧"
         );
