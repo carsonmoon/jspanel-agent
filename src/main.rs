@@ -361,7 +361,13 @@ async fn session(
     let mut last_frame = Instant::now();
 
     if !proxy_only {
-        send(&mut ws, notify("hello", serde_json::to_value(facts)?), remaining(last_frame)).await?;
+        // 订阅分发端口进结构化 hello（批次3）：x-sub-port 头退为老 hub 的兼容
+        // 退路，hub 以 hello params 为准（拼错是反序列化错误，不再是静默 0）。
+        let mut hello = serde_json::to_value(facts)?;
+        if let Some(obj) = hello.as_object_mut() {
+            obj.insert("sub_port".into(), serde_json::json!(sub_port));
+        }
+        send(&mut ws, notify("hello", hello), remaining(last_frame)).await?;
     } else {
         // 代理管控模式下，hub 靠这条指纹做对账（设计文档 5.5）。
         send(&mut ws, proxy::hash_frame(), remaining(last_frame)).await?;
