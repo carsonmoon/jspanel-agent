@@ -235,14 +235,15 @@ async fn run(method: &str, params: serde_json::Value) -> Result<serde_json::Valu
             let version = relay_install(params["version"].as_str().map(str::to_owned)).await?;
             Ok(serde_json::json!({ "version": version }))
         }
+        // 只拉起不碰配置的 poke（批次1b 独立方法）：曾借道 relay.apply 靠
+        // __noop__ 字面量+空 sha+ensure_started 三暗号区分——检查顺序就是
+        // 约定，检查顺序就是事故（字面量曾被旧版当配置写盘）。
+        "relay.ensure_started" => {
+            ensure_realm_started().await?;
+            Ok(serde_json::json!({ "ok": true }))
+        }
         "relay.apply" => {
             let _guard = apply_lock().lock().await;
-            // ensure_started：指纹一致但服务没跑时的「只拉起不碰配置」poke
-            // （hub 旧版这里发 __noop__ 字面量，会被当配置写盘损坏 realm.toml）。
-            if params["ensure_started"].as_bool().unwrap_or(false) {
-                ensure_realm_started().await?;
-                return Ok(serde_json::json!({ "ok": true }));
-            }
             let body = params["config"].as_str().context("缺少 config")?.to_owned();
             let want = params["sha256"].as_str().unwrap_or_default().to_owned();
             let got = if body.is_empty() { String::new() } else { hex(&Sha256::digest(body.as_bytes())) };
