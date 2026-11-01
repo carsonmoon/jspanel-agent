@@ -131,7 +131,7 @@ pub fn hash_frame() -> Message {
     Message::Text(
         serde_json::json!({
             "jsonrpc": "2.0", "method": "proxy.hash",
-            "params": {"hash": local_hash(), "relay_hash": realm_hash(), "version": singbox_version_cached()},
+            "params": {"hash": local_hash(), "relay_hash": realm_hash(), "gost_hash": gost_hash(), "version": singbox_version_cached()},
         })
         .to_string()
         .into(),
@@ -257,6 +257,28 @@ async fn run(method: &str, params: serde_json::Value) -> Result<serde_json::Valu
         "relay.probe" => {
             let results = relay_probe(&params).await;
             Ok(serde_json::json!({ "results": results }))
+        }
+        // gost 转发/隧道：与 relay.apply 同构（指纹校验 + 幂等短路在文件层），
+        // 应用走热重载——未变更规则的已建立连接不受影响（批次0 spike 实测）。
+        "gost.apply" => {
+            let _guard = gost_apply_lock().lock().await;
+            let body = params["config"].as_str().context("缺少 config")?.to_owned();
+            let want = params["sha256"].as_str().unwrap_or_default().to_owned();
+            let got = if body.is_empty() { String::new() } else { hex(&Sha256::digest(body.as_bytes())) };
+            if !want.is_empty() && want != got {
+                bail!("配置指纹不符：期望 {want}，收到 {got}");
+            }
+            let desired = params["desired_running"].as_bool().unwrap_or(true);
+            gost_apply(body, desired, &got).await?;
+            Ok(serde_json::json!({ "hash": got }))
+        }
+        "gost.ensure_started" => {
+            ensure_gost_started().await?;
+            Ok(serde_json::json!({ "ok": true }))
+        }
+        "gost.install" => {
+            let version = gost_install(params["version"].as_str().map(str::to_owned)).await?;
+            Ok(serde_json::json!({ "version": version }))
         }
         "net.http_probe" => {
             let result = http_probe(&params).await;
@@ -530,6 +552,7 @@ async fn status() -> serde_json::Value {
     } else {
         false
     };
+    let gost_installed = gost_bin().is_file();
     serde_json::json!({
         "installed_version": version,
         "running": running && desired,
@@ -538,7 +561,20 @@ async fn status() -> serde_json::Value {
         "listen_ports": [],
         "realm_version": realm_version,
         "realm_running": realm_running,
+        "gost_version": gost_version_string().await,
+        "gost_running": gost_installed && gost_active().await,
     })
+}
+
+/// gost 二进制版本（-V 输出形如 "gost 3.3.2 (go1.27.3 linux/amd64)"）。
+async fn gost_version_string() -> String {
+    if !gost_bin().is_file() {
+        return String::new();
+    }
+    match run_cmd(&gost_bin().to_string_lossy(), &["-V"]).await {
+        Ok(out) => String::from_utf8_lossy(&out.stdout).split_whitespace().nth(1).unwrap_or("").to_owned(),
+        Err(_) => String::new(),
+    }
 }
 
 async fn run_cmd(program: &str, args: &[&str]) -> Result<std::process::Output> {
@@ -1216,6 +1252,252 @@ async fn restart_realm() {
     }
 }
 
+// ---- gost 转发/隧道：原版 gost v3，配置文件单一事实源 + 热重载 ----
+// 纪律与 relay 同构：hub 渲染整份配置推 gost.apply，agent 落盘 + 应用，
+// 指纹进心跳对账。gost 原生不持久化 API 变更（flux-panel fork 才加的
+// saveConfig），所以只走「文件 + reload」一条路：盘上文件永远等于运行态
+// 期望，进程重启由文件恢复。
+
+/// 钉死的 gost 版本：批次0 spike 验证热重载语义用的就是它。升级走显式
+/// 变更——同时改这里的常量与 hub 侧的 ensure 安装期望。
+const GOST_VERSION: &str = "3.3.2";
+const GOST_REPO: &str = "go-gost/gost";
+/// gost API 服务地址：渲染出的配置固定开在这里（仅环回），热重载打它。
+const GOST_API: &str = "http://127.0.0.1:18080/config/reload";
+
+fn gost_bin() -> PathBuf {
+    base_dir().join("bin").join("gost")
+}
+
+fn gost_dir() -> PathBuf {
+    base_dir().join("instances").join("gost")
+}
+
+fn gost_config() -> PathBuf {
+    gost_dir().join("gost.json")
+}
+
+fn gost_hash() -> String {
+    std::fs::read_to_string(gost_config().with_extension("json.hash"))
+        .map(|s| s.trim().to_owned())
+        .unwrap_or_default()
+}
+
+fn gost_apply_lock() -> &'static tokio::sync::Mutex<()> {
+    static LOCK: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
+    LOCK.get_or_init(|| tokio::sync::Mutex::new(()))
+}
+
+fn gost_child_slot() -> &'static std::sync::Mutex<Option<tokio::process::Child>> {
+    static C: OnceLock<std::sync::Mutex<Option<tokio::process::Child>>> = OnceLock::new();
+    C.get_or_init(|| std::sync::Mutex::new(None))
+}
+
+async fn gost_active() -> bool {
+    if systemd() {
+        unit_active("monitor-gost@main").await
+    } else {
+        gost_child_slot()
+            .lock()
+            .map(|mut c| c.as_mut().is_some_and(|c| c.try_wait().map_or(true, |w| w.is_none())))
+            .unwrap_or(false)
+    }
+}
+
+/// monitor-gost@.service：WorkingDirectory 定在配置目录，ExecStart 显式
+/// -C 指到文件——reload 重读的就是这份（批次0 实测 -C 文件 reload 生效）。
+async fn write_gost_unit() -> Result<()> {
+    let unit_path = "/etc/systemd/system/monitor-gost@.service";
+    if Path::new(unit_path).exists() {
+        return Ok(());
+    }
+    std::fs::write(
+        unit_path,
+        format!(
+            "[Unit]\nDescription=monitor gost instance %i\nAfter=network-online.target\nWants=network-online.target\n\n[Service]\nType=simple\nWorkingDirectory={}\nExecStart={} -C {}\nRestart=always\nRestartSec=3\n\n[Install]\nWantedBy=multi-user.target\n",
+            gost_dir().display(),
+            gost_bin().display(),
+            gost_config().display()
+        ),
+    )?;
+    let _ = run_cmd("systemctl", &["daemon-reload"]).await;
+    Ok(())
+}
+
+fn spawn_gost_child() -> Result<()> {
+    let child = tokio::process::Command::new(gost_bin())
+        .arg("-C")
+        .arg(gost_config())
+        .current_dir(gost_dir())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .kill_on_drop(true)
+        .spawn()
+        .context("无法启动 gost（二进制未安装？先 gost.install）")?;
+    gost_child_slot().lock().unwrap().replace(child);
+    Ok(())
+}
+
+/// 热应用：进程在跑 → POST /config/reload（未变更规则的已建立连接不受
+/// 影响，批次0 实测）；没跑 → 拉起（首次冷启动完整加载）。reload 失败
+/// 回滚盘上文件到旧内容——运行态进程仍持旧配置，盘上指纹必须跟着旧配置
+/// 走，否则心跳对账拿新指纹反复重推同一个坏配置。
+async fn gost_apply(body: String, desired_running: bool, hash: &str) -> Result<()> {
+    if body.is_empty() {
+        // 空配置语义唯一：desired_running=false，停服务清文件（与 relay 同款协议）。
+        if desired_running {
+            bail!("空配置必须带 desired_running=false（期望停服务清理）");
+        }
+        if systemd() {
+            let _ = run_cmd("systemctl", &["stop", "monitor-gost@main"]).await;
+        } else {
+            let old = gost_child_slot().lock().unwrap().take();
+            if let Some(mut c) = old {
+                let _ = c.kill().await;
+            }
+        }
+        let _ = std::fs::remove_file(gost_config());
+        let _ = std::fs::remove_file(gost_config().with_extension("json.hash"));
+        return Ok(());
+    }
+    if !gost_bin().is_file() {
+        bail!("gost 尚未安装，请先安装（gost.install）");
+    }
+    tokio::fs::create_dir_all(&gost_dir()).await?;
+    let old_body = std::fs::read_to_string(gost_config()).ok();
+    let old_hash = gost_hash();
+    tokio::fs::write(gost_config(), &body).await?;
+    std::fs::write(gost_config().with_extension("json.hash"), hash)?;
+    if !systemd() {
+        let old = gost_child_slot().lock().unwrap().take();
+        if let Some(mut c) = old {
+            let _ = c.kill().await;
+        }
+        spawn_gost_child()?;
+        return Ok(());
+    }
+    write_gost_unit().await?;
+    if gost_active().await {
+        let resp = reqwest::Client::builder()
+            .timeout(Duration::from_secs(10))
+            .build()
+            .context("构建 HTTP 客户端失败")?
+            .post(GOST_API)
+            .send()
+            .await;
+        match resp {
+            Ok(r) if r.status().is_success() => return Ok(()),
+            Ok(r) => {
+                let status = r.status();
+                let detail = r.text().await.unwrap_or_default();
+                if let Some(old) = old_body {
+                    let _ = tokio::fs::write(gost_config(), old).await;
+                } else {
+                    let _ = std::fs::remove_file(gost_config());
+                }
+                std::fs::write(gost_config().with_extension("json.hash"), old_hash)?;
+                bail!("gost reload 被拒绝（{status}）：{detail}");
+            }
+            Err(e) => {
+                if let Some(old) = old_body {
+                    let _ = tokio::fs::write(gost_config(), old).await;
+                } else {
+                    let _ = std::fs::remove_file(gost_config());
+                }
+                std::fs::write(gost_config().with_extension("json.hash"), old_hash)?;
+                bail!("gost reload 请求失败：{e:#}——API 未监听？核心可能没在跑");
+            }
+        }
+    }
+    let rs = run_cmd("systemctl", &["start", "monitor-gost@main"]).await?;
+    if !rs.status.success() || !unit_active("monitor-gost@main").await {
+        let msg = String::from_utf8_lossy(&rs.stderr).trim().to_owned();
+        eprintln!("[proxy] gost start failed: {msg}");
+        bail!("gost 启动失败：{msg}");
+    }
+    Ok(())
+}
+
+async fn ensure_gost_started() -> Result<()> {
+    if gost_active().await {
+        return Ok(());
+    }
+    if !gost_bin().is_file() || !gost_config().exists() {
+        bail!("gost 未安装或无配置，无法拉起");
+    }
+    if systemd() {
+        write_gost_unit().await?;
+        let rs = run_cmd("systemctl", &["start", "monitor-gost@main"]).await?;
+        if !rs.status.success() {
+            bail!("gost 拉起失败：{}", String::from_utf8_lossy(&rs.stderr).trim());
+        }
+    } else {
+        let old = gost_child_slot().lock().unwrap().take();
+        if let Some(mut c) = old {
+            let _ = c.kill().await;
+        }
+        spawn_gost_child()?;
+    }
+    Ok(())
+}
+
+/// gost 安装：官方 GitHub Release 固定版本 tar.gz，解出单二进制到 bin/。
+/// 版本缺省取钉死常量；显式传版本用于升级演练。
+async fn gost_install(version: Option<String>) -> Result<String> {
+    let version = match version {
+        Some(v) => {
+            let v = v.trim().trim_start_matches('v').to_owned();
+            if v.is_empty() || !v.chars().all(|c| c.is_ascii_digit() || c == '.') {
+                bail!("版本号格式不对：{v}");
+            }
+            v
+        }
+        None => GOST_VERSION.to_owned(),
+    };
+    let os = match std::env::consts::OS {
+        "linux" => "linux",
+        "macos" => "darwin",
+        other => bail!("暂不支持 {other} 自动安装 gost"),
+    };
+    let arch = match std::env::consts::ARCH {
+        "x86_64" => "amd64",
+        "aarch64" => "arm64",
+        other => bail!("暂不支持 {other} 自动安装 gost"),
+    };
+    let url = format!(
+        "https://github.com/{GOST_REPO}/releases/download/v{version}/gost_{version}_{os}_{arch}.tar.gz"
+    );
+    let client = reqwest::Client::builder().timeout(Duration::from_secs(180)).build()?;
+    let bytes = client
+        .get(&url)
+        .header("User-Agent", "monitor-agent")
+        .send()
+        .await
+        .context("无法访问 GitHub")?
+        .error_for_status()
+        .with_context(|| format!("gost v{version} 的 {os}/{arch} 发布包不存在"))?
+        .bytes()
+        .await
+        .context("下载 gost 失败")?;
+    let tmp = std::env::temp_dir().join(format!("gost-install-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&tmp);
+    std::fs::create_dir_all(&tmp)?;
+    let tgz = tmp.join("gost.tar.gz");
+    std::fs::write(&tgz, &bytes)?;
+    let out =
+        tokio::process::Command::new("tar").args(["-xzf"]).arg(&tgz).arg("-C").arg(&tmp).output().await?;
+    anyhow::ensure!(out.status.success(), "解压 gost 失败: {}", String::from_utf8_lossy(&out.stderr));
+    std::fs::create_dir_all(gost_bin().parent().unwrap())?;
+    std::fs::copy(tmp.join("gost"), gost_bin()).context("发布包里没有 gost 二进制")?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(gost_bin(), std::fs::Permissions::from_mode(0o755))?;
+    }
+    let _ = std::fs::remove_dir_all(&tmp);
+    Ok(version)
+}
+
 async fn relay_apply(body: String, desired_running: bool, hash: &str) -> Result<()> {
     if body.is_empty() {
         // 空配置的语义唯一：desired_running=false，停服务清文件。「空体+true」
@@ -1455,11 +1737,16 @@ async fn mini_socks5(listener: tokio::net::TcpListener) {
 
 #[cfg(test)]
 mod tests {
+    /// MONITOR_PROXY_DIR 是进程级环境变量：所有隔离落点的测试共用这把锁
+    /// 串行执行，防止并行测试互相改掉对方的环境。
+    static ENV_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
     /// 空配置语义唯一性：desired_running=false 才是合法组合（停服务清文件）；
     /// true 是 hub 侧语义分叉遗物，现为协议错误。MONITOR_PROXY_DIR 隔离文件
     /// 落点，其余测试不读该变量、无并行干扰。
     #[tokio::test]
     async fn empty_relay_config_must_carry_desired_off() {
+        let _env = ENV_LOCK.lock().await;
         let dir = std::env::temp_dir().join(format!("monitor-agent-relay-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         std::env::set_var("MONITOR_PROXY_DIR", &dir);
@@ -1474,6 +1761,46 @@ mod tests {
         relay_apply(String::new(), false, "").await.unwrap();
         assert!(!realm_config().exists(), "合法语义：配置文件清除");
         assert!(!realm_config().with_extension("toml.hash").exists(), "指纹文件清除");
+
+        std::env::remove_var("MONITOR_PROXY_DIR");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// gost 空配置与 relay 同款语义：空体+true 是协议错误且不碰盘；
+    /// 空体+false 停服清文件。
+    #[tokio::test]
+    async fn empty_gost_config_must_carry_desired_off() {
+        let _env = ENV_LOCK.lock().await;
+        let dir = std::env::temp_dir().join(format!("monitor-agent-gost-{}", std::process::id()));
+        std::env::set_var("MONITOR_PROXY_DIR", &dir);
+        std::fs::create_dir_all(gost_config().parent().unwrap()).unwrap();
+        std::fs::write(gost_config(), "{\"services\":[]}").unwrap();
+        std::fs::write(gost_config().with_extension("json.hash"), "old-hash").unwrap();
+
+        let err = gost_apply(String::new(), true, "").await.unwrap_err();
+        assert!(err.to_string().contains("desired_running"), "空体+true 是协议错误: {err}");
+        assert!(gost_config().exists(), "协议错误不碰盘上文件");
+
+        gost_apply(String::new(), false, "").await.unwrap();
+        assert!(!gost_config().exists(), "合法语义：配置文件清除");
+        assert!(!gost_config().with_extension("json.hash").exists(), "指纹文件清除");
+
+        std::env::remove_var("MONITOR_PROXY_DIR");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 二进制未装时拒绝非空 apply，且不写任何盘上文件——hub 的 ensure 流程
+    /// 应先 gost.install 再 apply，这里守住「装都没装就推配置」的乱序。
+    #[tokio::test]
+    async fn gost_apply_without_binary_refuses_and_leaves_disk_untouched() {
+        let _env = ENV_LOCK.lock().await;
+        let dir = std::env::temp_dir().join(format!("monitor-agent-gost-nobin-{}", std::process::id()));
+        std::env::set_var("MONITOR_PROXY_DIR", &dir);
+
+        let err = gost_apply("{\"services\":[]}".to_owned(), true, "abc").await.unwrap_err();
+        assert!(err.to_string().contains("尚未安装"), "应提示先安装: {err}");
+        assert!(!gost_config().exists(), "拒绝时不落配置文件");
+        assert!(!gost_config().with_extension("json.hash").exists(), "拒绝时不落指纹");
 
         std::env::remove_var("MONITOR_PROXY_DIR");
         let _ = std::fs::remove_dir_all(&dir);
