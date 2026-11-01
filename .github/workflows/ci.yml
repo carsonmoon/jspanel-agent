@@ -26,7 +26,14 @@ jobs:
           components: clippy, rustfmt
       - run: cargo fmt --all --check
       - run: cargo clippy --all-targets -- -D warnings
-      - run: cargo test
+      # 失败时把完整测试输出传成 artifact——Actions 日志页对无 admin 权限的
+      # 排查者不可读（实测 403），artifact 是公开可下的。
+      - run: cargo test 2>&1 | tee test.log
+      - uses: actions/upload-artifact@v4
+        if: failure()
+        with:
+          name: test-log
+          path: test.log
 
       # This commit's agent against the latest released hub, through the hub
       # repository's end-to-end script: the reported fields are checked where
