@@ -45,8 +45,16 @@ jobs:
           git checkout --quiet "$PINNED_SHA"
           git apply --verbose ../realm-api/patches/*.patch
 
-      # 容器架构 = 目标架构：musl-tools 提供的是本机 musl 编译器，原生构建
-      # 免交叉工具链（aarch64 在 qemu 模拟下慢，但 arm64 仅作补充产物）。
+      # GitHub runner 无预装 binfmt，--platform linux/arm64 的容器会当场
+      # exec format error（曾致 arm64 腿 18 秒即死、产物缺席两轮）——必须先注册
+      # qemu。容器架构 = 目标架构：musl-tools 提供的是本机 musl 编译器，原生
+      # 构建免交叉工具链（aarch64 在 qemu 模拟下慢，但 arm64 仅作补充产物）。
+      - name: 注册 QEMU binfmt（arm64 容器依赖）
+        if: matrix.target == 'aarch64-unknown-linux-musl'
+        uses: docker/setup-qemu-action@v3
+        with:
+          platforms: arm64
+
       - name: musl 构建（${{ matrix.target }}）
         working-directory: realm-src
         run: |
