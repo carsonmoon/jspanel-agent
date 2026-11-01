@@ -147,23 +147,31 @@ async fn realm_units_snapshot() -> serde_json::Value {
     let mut map = serde_json::Map::new();
     // active 来自 realm HTTP API 的实例状态；进程不在/查询失败 → 全部
     // inactive（对账的 poke 会把进程拉回来）。sha 照报，不阻塞心跳。
-    let statuses: std::collections::HashMap<String, bool> = {
+    let api_list: Vec<(String, serde_json::Value, serde_json::Value)> = {
         let key =
             std::fs::read_to_string(realm_api_key_path()).map(|k| k.trim().to_owned()).unwrap_or_default();
         if key.is_empty() {
             Default::default()
         } else {
-            HttpRealmApi { key }
-                .list()
-                .await
-                .map(|v| v.into_iter().map(|(id, _, st)| (id, st.as_str() == Some("Running"))).collect())
-                .unwrap_or_default()
+            HttpRealmApi { key }.list().await.unwrap_or_default()
         }
     };
     for (id, sha) in &applied {
         let sha = sha.as_str().unwrap_or_default().to_owned();
-        let active = statuses.get(id).copied().unwrap_or(false);
+        let active = api_list
+            .iter()
+            .find(|(aid, _, _)| aid == id)
+            .map(|(_, _, st)| st.as_str() == Some("Running"))
+            .unwrap_or(false);
         map.insert(id.clone(), serde_json::json!({ "sha256": sha, "active": active }));
+    }
+    // ∪ 语义：API 侧存在但不在 applied 里的实例（漂移/手工建）也要上报——
+    // sha 置空串即「与期望不符」的信号，hub 对账按聚合不等重推收编。
+    for (id, _, st) in api_list {
+        if !map.contains_key(&id) {
+            let active = st.as_str() == Some("Running");
+            map.insert(id, serde_json::json!({ "sha256": "", "active": active }));
+        }
     }
     serde_json::Value::Object(map)
 }
@@ -586,7 +594,7 @@ async fn status() -> serde_json::Value {
             realm_children()
                 .lock()
                 .unwrap()
-                .get_mut("api")
+                .get_mut(REALM_API_CHILD)
                 .map(|c| c.try_wait().map_or(true, |w| w.is_none()))
                 .unwrap_or(false)
         }
@@ -652,7 +660,7 @@ pub async fn supervisor() {
             let dead = !realm_children()
                 .lock()
                 .unwrap()
-                .get_mut("api")
+                .get_mut(REALM_API_CHILD)
                 .map(|c| c.try_wait().map_or(true, |w| w.is_none()))
                 .unwrap_or(false);
             if dead && spawn_realm_api_child().await.is_err() {
@@ -1175,10 +1183,16 @@ fn realm_envelope_hash_path() -> PathBuf {
     realm_instances_dir().join("envelope.hash")
 }
 
-/// unit id 只允许两种形态：占位 "main" 或规则 id（纯数字，≤19 位）。
+/// unit id 只允许三种形态：占位 "main"、规则 id（纯数字，≤19 位）、隧道
+/// 出口半边 `<规则id>-exit`（hub 的 render_relay_instances 按此渲染）。
 /// hub 是可信端，但这是路径拼接入口——设卡防逃逸（instances/<id>/）。
+/// 评审修复（2026-11-02）：曾只放行纯数字，出口半边整包 apply 被拒。
 fn valid_unit_id(id: &str) -> bool {
-    id == "main" || (!id.is_empty() && id.len() <= 19 && id.chars().all(|c| c.is_ascii_digit()))
+    let (id, is_exit) = match id.strip_suffix("-exit") {
+        Some(base) => (base, true),
+        None => (id, false),
+    };
+    id == "main" && !is_exit || (!id.is_empty() && id.len() <= 19 && id.chars().all(|c| c.is_ascii_digit()))
 }
 
 /// 机器级指纹：信封优先（新协议），回落 main 的单文件指纹（旧协议/过渡期）。
@@ -1276,7 +1290,7 @@ async fn ensure_realm_started() -> Result<()> {
         realm_children()
             .lock()
             .unwrap()
-            .get_mut("api")
+            .get_mut(REALM_API_CHILD)
             .map(|c| c.try_wait().map_or(true, |w| w.is_none()))
             .unwrap_or(false)
     };
@@ -1284,8 +1298,15 @@ async fn ensure_realm_started() -> Result<()> {
         return Ok(());
     }
     if systemd() {
-        let _ = run_cmd("systemctl", &["start", "monitor-realm-api"]).await;
-        eprintln!("[proxy] realm-api unit poked back up");
+        match run_cmd("systemctl", &["start", "monitor-realm-api"]).await {
+            Ok(out) if out.status.success() => eprintln!("[proxy] realm-api unit poked back up"),
+            Ok(out) => eprintln!(
+                "[proxy] systemctl start monitor-realm-api failed: exit {}, {}",
+                out.status,
+                String::from_utf8_lossy(&out.stderr).trim()
+            ),
+            Err(e) => eprintln!("[proxy] systemctl start monitor-realm-api failed: {e}"),
+        }
     } else {
         spawn_realm_api_child().await?;
     }
@@ -1668,6 +1689,9 @@ fn units_aggregate(units: &[(&str, &str)]) -> String {
 }
 
 /// API 端口恒回环（fork 补丁也在服务端钉死了 127.0.0.1，双保险）。
+/// dev 模式 realm api 子进程在槽里的键。
+const REALM_API_CHILD: &str = "api";
+
 fn realm_api_port() -> u16 {
     18080
 }
@@ -1904,7 +1928,7 @@ async fn ensure_realm_api_unit() -> Result<String> {
 /// dev 环境拉起 realm api 子进程（key/store 从盘上配置读）。
 async fn spawn_realm_api_child() -> Result<()> {
     let key = std::fs::read_to_string(realm_api_key_path()).map(|k| k.trim().to_owned()).unwrap_or_default();
-    let old = realm_children().lock().unwrap().remove("api");
+    let old = realm_children().lock().unwrap().remove(REALM_API_CHILD);
     if let Some(mut c) = old {
         let _ = c.kill().await;
     }
@@ -1919,7 +1943,7 @@ async fn spawn_realm_api_child() -> Result<()> {
         .kill_on_drop(true)
         .spawn()
         .context("无法启动 realm api")?;
-    realm_children().lock().unwrap().insert("api".into(), child);
+    realm_children().lock().unwrap().insert(REALM_API_CHILD.into(), child);
     eprintln!("[proxy] realm api child started");
     Ok(())
 }
@@ -1935,7 +1959,7 @@ async fn ensure_realm_api_running(key: &str) -> Result<()> {
         let alive = realm_children()
             .lock()
             .unwrap()
-            .get_mut("api")
+            .get_mut(REALM_API_CHILD)
             .map(|c| c.try_wait().map_or(true, |w| w.is_none()))
             .unwrap_or(false);
         if !alive {
@@ -2373,6 +2397,20 @@ mod tests {
             }
             Ok(())
         }
+    }
+
+    /// unit id 白名单回归（评审 2026-11-02）：出口半边 <digits>-exit 必须放行
+    /// ——曾只放行纯数字，隧道出口腿整包 apply 被拒。
+    #[test]
+    fn valid_unit_id_accepts_exit_suffix() {
+        assert!(valid_unit_id("17"));
+        assert!(valid_unit_id("17-exit"));
+        assert!(valid_unit_id("main"));
+        assert!(!valid_unit_id("exit"));
+        assert!(!valid_unit_id("-exit"));
+        assert!(!valid_unit_id("17-exit-x"));
+        assert!(!valid_unit_id("../evil"));
+        assert!(!valid_unit_id("17-exit/../evil"));
     }
 
     /// 非法 unit id（路径逃逸形态）整包拒绝，盘上零写入。
