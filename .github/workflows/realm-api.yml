@@ -37,6 +37,9 @@ jobs:
         run: |
           git clone --quiet https://github.com/zhboner/realm.git realm-src
           cd realm-src
+          # PR head 提交只存在于 pull ref 上，plain clone 拿不到——显式 fetch
+          # 再 checkout 钉死 SHA（顺带校验 ref 未被替换）。
+          git fetch --quiet origin "refs/pull/160/head"
           git checkout --quiet "$PINNED_SHA"
           git apply --verbose ../realm-api/patches/*.patch
 
