@@ -1226,7 +1226,8 @@ async fn relay_install(version: Option<String>) -> Result<String> {
         (os, arch) => bail!("暂不支持 {os}/{arch} 自动安装 Realm"),
     };
     let name = format!("realm-{target}.tar.gz");
-    let url = format!("https://github.com/{REALM_REPO}/releases/download/v{version}/{name}");
+    // tag 前缀 realm-api-（本仓混 agent tag，realm 发表的 tag 统一带此前缀）
+    let url = format!("https://github.com/{REALM_REPO}/releases/download/realm-api-v{version}/{name}");
     let client = reqwest::Client::builder().timeout(Duration::from_secs(180)).build()?;
     let bytes = client
         .get(url)
