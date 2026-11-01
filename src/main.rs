@@ -370,7 +370,7 @@ async fn session(
         send(&mut ws, notify("hello", hello), remaining(last_frame)).await?;
     } else {
         // 代理管控模式下，hub 靠这条指纹做对账（设计文档 5.5）。
-        send(&mut ws, proxy::hash_frame(), remaining(last_frame)).await?;
+        send(&mut ws, proxy::hash_frame().await, remaining(last_frame)).await?;
     }
 
     let (result_tx, mut result_rx) = mpsc::channel::<Message>(64);
@@ -392,7 +392,7 @@ async fn session(
             }
             // 哈希心跳两种模式都发：远程对账（推送配置）靠它驱动。
             _ = hash_ticker.tick() => {
-                if let Err(e) = send(&mut ws, proxy::hash_frame(), remaining(last_frame)).await { break Err(e); }
+                if let Err(e) = send(&mut ws, proxy::hash_frame().await, remaining(last_frame)).await { break Err(e); }
             }
             _ = stats_ticker.tick() => {
                 if let Some(frame) = proxy::stats_frame().await {
