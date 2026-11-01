@@ -1876,7 +1876,8 @@ async fn ensure_realm_api_unit() -> Result<String> {
             k
         }
     };
-    let conf = r#"{"log":{"level":"warn"},"network":{}}"#;
+    // FullConf 的 endpoints 无 serde default（PR 原样），JSON 全局配置必须显式带空数组。
+    let conf = r#"{"log":{"level":"warn"},"network":{},"endpoints":[]}"#;
     std::fs::write(realm_api_conf_path(), conf)?;
     if systemd() {
         let unit = format!(
