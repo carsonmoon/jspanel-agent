@@ -26,6 +26,11 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy, rustfmt
+      # workflow 自身的机械检查：管道吞退出码/路径错位类错误在 run 步里，
+      # shellcheck 够不到（retro 2026-11-02）。
+      - run: |
+          bash <(curl -fsSL https://raw.githubusercontent.com/rhysd/actionlint/main/scripts/download-actionlint.bash)
+          ./actionlint -color
       - run: cargo fmt --all --check
       - run: cargo clippy --all-targets -- -D warnings
       # 失败时把完整测试输出传成 artifact——Actions 日志页对无 admin 权限的

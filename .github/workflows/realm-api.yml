@@ -74,3 +74,5 @@ jobs:
           files: |
             realm-${{ matrix.target }}.tar.gz
             sha256sums-${{ matrix.target }}.txt
+          # 静默零资产曾让 agent 侧 404 循环——产物不齐宁可红。
+          fail_on_unmatched_files: true
