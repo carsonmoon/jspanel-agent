@@ -29,6 +29,8 @@ jobs:
           - target: aarch64-unknown-linux-musl
             platform: linux/arm64
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
     continue-on-error: ${{ matrix.target != 'x86_64-unknown-linux-musl' }}
     steps:
       - uses: actions/checkout@v4
@@ -62,29 +64,11 @@ jobs:
           tar -czf "realm-${{ matrix.target }}.tar.gz" -C "target/${{ matrix.target }}/release" realm
           sha256sum "realm-${{ matrix.target }}.tar.gz" | tee sha256sums-${{ matrix.target }}.txt
 
-      - uses: actions/upload-artifact@v4
-        with:
-          name: realm-${{ matrix.target }}
-          path: |
-            realm-${{ matrix.target }}.tar.gz
-            sha256sums-${{ matrix.target }}.txt
-
-  release:
-    needs: build
-    # arm64 是补充产物（continue-on-error）：整体 success 即发布（含单架构）。
-    if: ${{ needs.build.result == 'success' }}
-    runs-on: ubuntu-latest
-    permissions:
-      contents: write
-    steps:
-      - uses: actions/download-artifact@v4
-        with:
-          pattern: realm-*
-          merge-multiple: true
-          path: dist
-
+      # 各构建 job 直接向同一 tag 发资产（action 追加到既有 Release）——
+      # 不走 artifact 中转（v4 下载空匹配曾把发布卡死，两段式徒增故障面）。
       - uses: softprops/action-gh-release@v2
         with:
           name: realm-api ${{ github.ref_name }}
-          files: dist/*
-          fail_on_unmatched_files: true
+          files: |
+            realm-${{ matrix.target }}.tar.gz
+            sha256sums-${{ matrix.target }}.txt
