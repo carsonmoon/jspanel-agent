@@ -430,7 +430,8 @@ async fn session(
                             }
                             // net.*：net.http_probe（出口测速/出口链诊断，net. 前缀
                             // 此前不在白名单里被静默丢弃，远程探测从未真正执行）。
-                            Some(m) if m.starts_with("proxy.") || m.starts_with("relay.") || m.starts_with("net.") => {
+                            // gost.*：隧道模块同款教训——白名单漏前缀=静默丢帧。
+                            Some(m) if m.starts_with("proxy.") || m.starts_with("relay.") || m.starts_with("net.") || m.starts_with("gost.") => {
                                 let params = v.get("params").cloned().unwrap_or_default();
                                 proxy::dispatch(m.to_owned(), params, id, &result_tx);
                             }
