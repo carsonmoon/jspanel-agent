@@ -63,6 +63,8 @@ jobs:
         run: |
           tar -czf "realm-${{ matrix.target }}.tar.gz" -C "target/${{ matrix.target }}/release" realm
           sha256sum "realm-${{ matrix.target }}.tar.gz" | tee sha256sums-${{ matrix.target }}.txt
+          # softprops 在仓根找 files——产物上提到工作区根（路径错位曾静默零资产）。
+          mv "realm-${{ matrix.target }}.tar.gz" "sha256sums-${{ matrix.target }}.txt" ../
 
       # 各构建 job 直接向同一 tag 发资产（action 追加到既有 Release）——
       # 不走 artifact 中转（v4 下载空匹配曾把发布卡死，两段式徒增故障面）。
