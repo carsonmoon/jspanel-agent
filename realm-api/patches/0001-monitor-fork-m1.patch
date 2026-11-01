@@ -1,0 +1,473 @@
+From 53f4504167510864733598b756cdbbbd292d887f Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?=E5=8F=AF=E4=B9=90=E6=98=AF=E6=AC=A7=E7=9A=87?=
+ <406028423@qq.com>
+Date: Sun, 1 Nov 2026 23:34:31 +0800
+Subject: [PATCH] =?UTF-8?q?monitor=20fork=20m1:=20=E5=9F=BA=E4=BA=8E=20PR?=
+ =?UTF-8?q?=20#160=20head=EF=BC=88e9b5c05=EF=BC=8Cv2.9.8=EF=BC=89=E7=9A=84?=
+ =?UTF-8?q?=E7=AE=A1=E6=8E=A7=E9=9D=A2=E8=A1=A5=E4=B8=81?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+- API 监听固定 127.0.0.1（原 0.0.0.0 硬编码——管控面绝不暴露公网）
+- POST /instances 支持客户端指定实例 id（白名单 [A-Za-z0-9_-]{1,64}，
+  重复 id 409 并 abort 已起任务）——管控面对账需要稳定的规则id↔实例映射，
+  上游 uuid 随机 id 无法收敛
+- API key 常量时间比较（计时侧信道）
+- start_instance 重生前 abort 残留句柄（Failed 态句柄泄漏）
+- lightws 0.6.13→0.6.14（0.6.13 在 rustc 1.9x 下 BorrowedBuf 编译错）
+- version 2.9.8-m1（semver prerelease，--version 可辨识 fork 构建）
+
+上游 PR #160 未被合并（zhboner/realm），head ref 拉取；本分支为
+monitor 项目自维护的 realm API 构建。
+---
+ Cargo.lock | 162 ++++++++++++++++++++++++++++++++++++++---------------
+ Cargo.toml |   2 +-
+ src/api.rs |  54 ++++++++++++++++--
+ 3 files changed, 169 insertions(+), 49 deletions(-)
+
+diff --git a/Cargo.lock b/Cargo.lock
+index 2062dbc..d70b2d2 100644
+--- a/Cargo.lock
++++ b/Cargo.lock
+@@ -234,12 +234,6 @@ dependencies = [
+  "windows-targets 0.52.6",
+ ]
+ 
+-[[package]]
+-name = "base64"
+-version = "0.21.7"
+-source = "registry+https://github.com/rust-lang/crates.io-index"
+-checksum = "9d297deb1925b89f2ccc13d7635fa0714f12c87adce1c75356b39ca9b7178567"
+-
+ [[package]]
+ name = "base64"
+ version = "0.22.1"
+@@ -284,6 +278,15 @@ dependencies = [
+  "generic-array",
+ ]
+ 
++[[package]]
++name = "block-buffer"
++version = "0.12.1"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "d2f6c7dbe95a6ed67ad9f18e57daf93a2f034c524b99fd2b76d18fdfeb6660aa"
++dependencies = [
++ "hybrid-array",
++]
++
+ [[package]]
+ name = "bumpalo"
+ version = "3.19.0"
+@@ -322,6 +325,17 @@ version = "1.0.1"
+ source = "registry+https://github.com/rust-lang/crates.io-index"
+ checksum = "9555578bc9e57714c812a1f84e4fc5b4d21fcb063490c624de019f7464c91268"
+ 
++[[package]]
++name = "chacha20"
++version = "0.10.2"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "65c35e4b699c7e15ccbe7ee35c005e4fc0a278d22238a2857e6ce2dadeda1b06"
++dependencies = [
++ "cfg-if",
++ "cpufeatures 0.3.1",
++ "rand_core 0.10.1",
++]
++
+ [[package]]
+ name = "chrono"
+ version = "0.4.41"
+@@ -389,6 +403,12 @@ version = "1.0.4"
+ source = "registry+https://github.com/rust-lang/crates.io-index"
+ checksum = "b05b61dc5112cbb17e4b6cd61790d9845d13888356391624cbe7e41efeac1e75"
+ 
++[[package]]
++name = "const-oid"
++version = "0.10.2"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "a6ef517f0926dd24a1582492c791b6a4818a4d94e789a334894aa15b0d12f55c"
++
+ [[package]]
+ name = "core-foundation-sys"
+ version = "0.8.7"
+@@ -404,6 +424,15 @@ dependencies = [
+  "libc",
+ ]
+ 
++[[package]]
++name = "cpufeatures"
++version = "0.3.1"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "5ca28b0ae3115b884660db4118d803791fd6756b6e88f39c0f3f7859060d7566"
++dependencies = [
++ "libc",
++]
++
+ [[package]]
+ name = "critical-section"
+ version = "1.2.0"
+@@ -444,6 +473,15 @@ dependencies = [
+  "typenum",
+ ]
+ 
++[[package]]
++name = "crypto-common"
++version = "0.2.2"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "ce6e4c961d6cd6c9a86db418387425e8bdeaf05b3c8bc1411e6dca4c252f1453"
++dependencies = [
++ "hybrid-array",
++]
++
+ [[package]]
+ name = "daemonize"
+ version = "0.5.0"
+@@ -474,8 +512,19 @@ version = "0.10.7"
+ source = "registry+https://github.com/rust-lang/crates.io-index"
+ checksum = "9ed9a281f7bc9b7576e61468ba615a66a5c8cfdff42420a70aa82701a3b1e292"
+ dependencies = [
+- "block-buffer",
+- "crypto-common",
++ "block-buffer 0.10.4",
++ "crypto-common 0.1.6",
++]
++
++[[package]]
++name = "digest"
++version = "0.11.3"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "f1dd6dbb5841937940781866fa1281a1ff7bd3bf827091440879f9994983d5c2"
++dependencies = [
++ "block-buffer 0.12.1",
++ "const-oid",
++ "crypto-common 0.2.2",
+ ]
+ 
+ [[package]]
+@@ -735,10 +784,22 @@ checksum = "26145e563e54f2cadc477553f1ec5ee650b00862f0a58bcd12cbdc5f0ea2d2f4"
+ dependencies = [
+  "cfg-if",
+  "libc",
+- "r-efi",
++ "r-efi 5.3.0",
+  "wasi 0.14.2+wasi-0.2.4",
+ ]
+ 
++[[package]]
++name = "getrandom"
++version = "0.4.3"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "300e883d756b2e4ec94e02791f39b04b522276138852cfc41d9fb7e904106099"
++dependencies = [
++ "cfg-if",
++ "libc",
++ "r-efi 6.0.0",
++ "rand_core 0.10.1",
++]
++
+ [[package]]
+ name = "gimli"
+ version = "0.31.1"
+@@ -763,13 +824,13 @@ version = "0.4.1"
+ source = "registry+https://github.com/rust-lang/crates.io-index"
+ checksum = "b3314d5adb5d94bcdf56771f2e50dbbc80bb4bdf88967526706205ac9eff24eb"
+ dependencies = [
+- "base64 0.22.1",
++ "base64",
+  "bytes",
+  "headers-core",
+  "http",
+  "httpdate",
+  "mime",
+- "sha1",
++ "sha1 0.10.6",
+ ]
+ 
+ [[package]]
+@@ -888,6 +949,15 @@ version = "1.0.3"
+ source = "registry+https://github.com/rust-lang/crates.io-index"
+ checksum = "df3b46402a9d5adb4c86a0cf463f42e19994e3ee891101b1841f30a545cb49a9"
+ 
++[[package]]
++name = "hybrid-array"
++version = "0.4.10"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "3944cf8cf766b40e2a1a333ee5e9b563f854d5fa49d6a8ca2764e97c6eddb214"
++dependencies = [
++ "typenum",
++]
++
+ [[package]]
+ name = "hyper"
+ version = "1.7.0"
+@@ -1252,15 +1322,15 @@ dependencies = [
+ 
+ [[package]]
+ name = "lightws"
+-version = "0.6.13"
++version = "0.6.14"
+ source = "registry+https://github.com/rust-lang/crates.io-index"
+-checksum = "a9a3f3a436eaa9e20fb21631849c05f3778f17d6de69ef7e253930f630e44cfd"
++checksum = "d0dafe85d15abfc66f86b43a87d1e86d6cf2b48f585e3ab4ca0ac4d0641496d9"
+ dependencies = [
+- "base64 0.21.7",
++ "base64",
+  "cfg-if",
+  "httparse",
+- "rand 0.8.5",
+- "sha1",
++ "rand 0.10.3",
++ "sha1 0.11.0",
+  "tokio",
+ ]
+ 
+@@ -1491,7 +1561,7 @@ version = "3.0.5"
+ source = "registry+https://github.com/rust-lang/crates.io-index"
+ checksum = "38af38e8470ac9dee3ce1bae1af9c1671fffc44ddfd8bd1d0a3445bf349a8ef3"
+ dependencies = [
+- "base64 0.22.1",
++ "base64",
+  "serde",
+ ]
+ 
+@@ -1617,15 +1687,10 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
+ checksum = "69cdb34c158ceb288df11e18b4bd39de994f6657d83847bdffdbd7f346754b0f"
+ 
+ [[package]]
+-name = "rand"
+-version = "0.8.5"
++name = "r-efi"
++version = "6.0.0"
+ source = "registry+https://github.com/rust-lang/crates.io-index"
+-checksum = "34af8d1a0e25924bc5b7c43c079c942339d8f0a8b57c39049bef581b46327404"
+-dependencies = [
+- "libc",
+- "rand_chacha 0.3.1",
+- "rand_core 0.6.4",
+-]
++checksum = "f8dcc9c7d52a811697d2151c701e0d08956f92b0e24136cf4cf27b57a6a0d9bf"
+ 
+ [[package]]
+ name = "rand"
+@@ -1633,18 +1698,19 @@ version = "0.9.2"
+ source = "registry+https://github.com/rust-lang/crates.io-index"
+ checksum = "6db2770f06117d490610c7488547d543617b21bfa07796d7a12f6f1bd53850d1"
+ dependencies = [
+- "rand_chacha 0.9.0",
++ "rand_chacha",
+  "rand_core 0.9.3",
+ ]
+ 
+ [[package]]
+-name = "rand_chacha"
+-version = "0.3.1"
++name = "rand"
++version = "0.10.3"
+ source = "registry+https://github.com/rust-lang/crates.io-index"
+-checksum = "e6c10a63a0fa32252be49d21e7709d4d4baf8d231c2dbce1eaa8141b9b127d88"
++checksum = "65c9fb96cbc91e3478eaae79a69fcd3f1ae4ad052e471fe6732fff548984b4af"
+ dependencies = [
+- "ppv-lite86",
+- "rand_core 0.6.4",
++ "chacha20",
++ "getrandom 0.4.3",
++ "rand_core 0.10.1",
+ ]
+ 
+ [[package]]
+@@ -1659,21 +1725,18 @@ dependencies = [
+ 
+ [[package]]
+ name = "rand_core"
+-version = "0.6.4"
++version = "0.9.3"
+ source = "registry+https://github.com/rust-lang/crates.io-index"
+-checksum = "ec0be4795e2f6a28069bec0b5ff3e2ac9bafc99e6a9a7dc3547996c5c816922c"
++checksum = "99d9a13982dcf210057a8a78572b2217b667c3beacbf3a0d8b454f6f82837d38"
+ dependencies = [
+- "getrandom 0.2.16",
++ "getrandom 0.3.3",
+ ]
+ 
+ [[package]]
+ name = "rand_core"
+-version = "0.9.3"
++version = "0.10.1"
+ source = "registry+https://github.com/rust-lang/crates.io-index"
+-checksum = "99d9a13982dcf210057a8a78572b2217b667c3beacbf3a0d8b454f6f82837d38"
+-dependencies = [
+- "getrandom 0.3.3",
+-]
++checksum = "63b8176103e19a2643978565ca18b50549f6101881c443590420e4dc998a3c69"
+ 
+ [[package]]
+ name = "rcgen"
+@@ -1691,7 +1754,7 @@ dependencies = [
+ 
+ [[package]]
+ name = "realm"
+-version = "2.9.7"
++version = "2.9.8-m1"
+ dependencies = [
+  "axum",
+  "cfg-if",
+@@ -1909,7 +1972,7 @@ dependencies = [
+  "errno",
+  "libc",
+  "linux-raw-sys",
+- "windows-sys 0.59.0",
++ "windows-sys 0.52.0",
+ ]
+ 
+ [[package]]
+@@ -2066,8 +2129,19 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
+ checksum = "e3bf829a2d51ab4a5ddf1352d8470c140cadc8301b2ae1789db023f01cedd6ba"
+ dependencies = [
+  "cfg-if",
+- "cpufeatures",
+- "digest",
++ "cpufeatures 0.2.17",
++ "digest 0.10.7",
++]
++
++[[package]]
++name = "sha1"
++version = "0.11.0"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "aacc4cc499359472b4abe1bf11d0b12e688af9a805fa5e3016f9a386dc2d0214"
++dependencies = [
++ "cfg-if",
++ "cpufeatures 0.3.1",
++ "digest 0.11.3",
+ ]
+ 
+ [[package]]
+@@ -2652,7 +2726,7 @@ version = "0.1.9"
+ source = "registry+https://github.com/rust-lang/crates.io-index"
+ checksum = "cf221c93e13a30d793f7645a0e7762c55d169dbb0a49671918a2319d289b10bb"
+ dependencies = [
+- "windows-sys 0.59.0",
++ "windows-sys 0.48.0",
+ ]
+ 
+ [[package]]
+diff --git a/Cargo.toml b/Cargo.toml
+index ef72458..c94174f 100644
+--- a/Cargo.toml
++++ b/Cargo.toml
+@@ -1,6 +1,6 @@
+ [package]
+ name = "realm"
+-version = "2.9.8"
++version = "2.9.8-m1"
+ authors = ["zhboner <zhboner@gmail.com>"]
+ edition = "2021"
+ 
+diff --git a/src/api.rs b/src/api.rs
+index be0bd22..03cc9b1 100644
+--- a/src/api.rs
++++ b/src/api.rs
+@@ -22,6 +22,23 @@ use realm_core::udp::run_udp;
+ 
+ pub const ENV_API_KEY: &str = "REALM_API_KEY";
+ 
++/// monitor fork (m1): 常量时间字节比较（长度不等直接否——key 定长 hex，不泄长度）。
++fn constant_time_eq(a: &str, b: &str) -> bool {
++    let (a, b) = (a.as_bytes(), b.as_bytes());
++    if a.len() != b.len() {
++        return false;
++    }
++    a.iter().zip(b.iter()).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
++}
++
++/// monitor fork (m1): 客户端指定的实例 id 白名单——id 会出现在持久化文件与
++/// 日志里，且 GET/DELETE 按路径段解析，只允许安全字符。
++fn valid_instance_id(id: &str) -> bool {
++    !id.is_empty()
++        && id.len() <= 64
++        && id.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
++}
++
+ static X_API_KEY: HeaderName = HeaderName::from_static("x-api-key");
+ 
+ async fn auth_middleware(
+@@ -37,7 +54,8 @@ async fn auth_middleware(
+     if let Some(api_key_header) = headers.get(&X_API_KEY) {
+         if let Ok(provided_key) = api_key_header.to_str() {
+             if let Some(expected_key) = &state.api_key {
+-                if provided_key == expected_key {
++                // monitor fork (m1): 常量时间比较，避免计时侧信道逐字节猜 key。
++                if constant_time_eq(provided_key, expected_key) {
+                     return Ok(next.run(request).await);
+                 }
+             }
+@@ -236,13 +254,22 @@ async fn list_instances(State(state): State<AppState>) -> Json<Vec<Instance>> {
+ 
+ async fn create_instance(
+     State(state): State<AppState>,
+-    Json(mut config): Json<EndpointConf>,
++    Json(mut body): Json<serde_json::Value>,
+ ) -> Result<Json<Instance>, StatusCode> {
++    // monitor fork (m1): 支持客户端指定实例 id（管控面对账需要稳定的
++    // 「规则 id ↔ 实例」映射）；缺省回落 uuid 保持上游行为。
++    let client_id = match body.get("id").and_then(|v| v.as_str()) {
++        Some(id) if valid_instance_id(id) => Some(id.to_owned()),
++        Some(_) => return Err(StatusCode::UNPROCESSABLE_ENTITY),
++        None => None,
++    };
++    let mut config: EndpointConf =
++        serde_json::from_value(body).map_err(|_| StatusCode::UNPROCESSABLE_ENTITY)?;
+     if let Some(global_config) = &state.global_config {
+         config.network.take_field(&global_config.network);
+     }
+ 
+-    let id = uuid::Uuid::new_v4().to_string();
++    let id = client_id.unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+     let instance = Instance {
+         id: id.clone(),
+         config: config.clone(),
+@@ -272,6 +299,16 @@ async fn create_instance(
+     };
+ 
+     let mut instances = state.instances.lock().await;
++    // monitor fork (m1): id 冲突显式 409（上游 uuid 撞不出来，客户端 id 会撞）。
++    if instances.contains_key(&id) {
++        if let Some(h) = tcp_handle {
++            h.abort();
++        }
++        if let Some(h) = udp_handle {
++            h.abort();
++        }
++        return Err(StatusCode::CONFLICT);
++    }
+     instances.insert(
+         id,
+         InstanceData {
+@@ -387,6 +424,14 @@ async fn start_instance(State(state): State<AppState>, Path(id): Path<String>) -
+                 return Err(StatusCode::CONFLICT);
+             }
+         }
++        // monitor fork (m1): Failed 态可能残留旧任务句柄，重生前必须 abort，
++        // 否则句柄泄漏（上游只在 update/delete/stop 里 abort）。
++        if let Some(h) = data.tcp_handle.take() {
++            h.abort();
++        }
++        if let Some(h) = data.udp_handle.take() {
++            h.abort();
++        }
+ 
+         let endpoint_info = data.instance.config.clone().build();
+         let (tcp_handle, udp_handle) = match start_realm_endpoint(endpoint_info) {
+@@ -683,7 +728,8 @@ pub async fn start_api_server(
+         .merge(api_routes)
+         .with_state(state);
+ 
+-    let addr = format!("0.0.0.0:{}", port);
++    // monitor fork (m1): API 只服务本机管控面（agent 经回环调用），绝不暴露公网。
++    let addr = format!("127.0.0.1:{}", port);
+     if let Some(_key) = &api_key {
+         println!("Starting API server on {} with authentication enabled", addr);
+         println!("API key loaded from REALM_API_KEY environment variable");
+-- 
+2.56.0
+

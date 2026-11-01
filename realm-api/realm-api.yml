@@ -1,0 +1,87 @@
+# realm-api：带实例管理 HTTP API 的 realm 构建（PR #160 monitor fork）。
+#
+# 源码链路：zhboner/realm 钉在 PR #160 head（e9b5c05，yosebyte 的
+# 「单进程 + 进程内多实例 + HTTP API」实现，上游未合并）+ realm-api/patches/
+# 里的 monitor 补丁（回环监听/客户端实例 id/常时比较/句柄泄漏修复）。
+# 上游补了新功能时：更新 PINNED_SHA 并重放补丁（冲突时先重开补丁）。
+#
+# 触发：推 realm-api-v* 形式的 tag（如 realm-api-v2.9.8-m1）→ 双架构 musl
+# 构建 → Release 附加 realm-<target>.tar.gz。agent 侧按钉死版本直取
+# releases/download/<tag>/（不走 releases/latest——本仓混着 agent 的 v1.x tag）。
+name: realm-api
+
+on:
+  push:
+    tags:
+      - "realm-api-v*"
+
+env:
+  # PR #160 head（zhboner/realm）。改这里必须连补丁一起重验。
+  PINNED_SHA: e9b5c05bea48e6c960517e7b07f16d5155c6b1aa
+
+jobs:
+  build:
+    strategy:
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-musl
+            platform: linux/amd64
+          - target: aarch64-unknown-linux-musl
+            platform: linux/arm64
+    runs-on: ubuntu-latest
+    continue-on-error: ${{ matrix.target != 'x86_64-unknown-linux-musl' }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 拉取 realm 源码（PR #160 head）并打 monitor 补丁
+        run: |
+          git clone --quiet https://github.com/zhboner/realm.git realm-src
+          cd realm-src
+          git checkout --quiet "$PINNED_SHA"
+          git apply --verbose ../realm-api/patches/*.patch
+
+      # 容器架构 = 目标架构：musl-tools 提供的是本机 musl 编译器，原生构建
+      # 免交叉工具链（aarch64 在 qemu 模拟下慢，但 arm64 仅作补充产物）。
+      - name: musl 构建（${{ matrix.target }}）
+        working-directory: realm-src
+        run: |
+          docker run --rm --platform ${{ matrix.platform }} -v "$PWD":/work \
+            -v "${{ github.workspace }}/.cargo-registry":/usr/local/cargo/registry \
+            -w /work rust:1-slim-bookworm sh -c '
+              set -e
+              apt-get update -qq >/dev/null && apt-get install -y -qq musl-tools >/dev/null
+              rustup target add ${{ matrix.target }}
+              cargo build --release --target ${{ matrix.target }} --no-default-features --features default-ring'
+
+      - name: 打包与校验和
+        working-directory: realm-src
+        run: |
+          tar -czf "realm-${{ matrix.target }}.tar.gz" -C "target/${{ matrix.target }}/release" realm
+          sha256sum "realm-${{ matrix.target }}.tar.gz" | tee sha256sums-${{ matrix.target }}.txt
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: realm-${{ matrix.target }}
+          path: |
+            realm-${{ matrix.target }}.tar.gz
+            sha256sums-${{ matrix.target }}.txt
+
+  release:
+    needs: build
+    # arm64 是补充产物（continue-on-error）：整体 success 即发布（含单架构）。
+    if: ${{ needs.build.result == 'success' }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: realm-*
+          merge-multiple: true
+          path: dist
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          name: realm-api ${{ github.ref_name }}
+          files: dist/*
+          fail_on_unmatched_files: true
