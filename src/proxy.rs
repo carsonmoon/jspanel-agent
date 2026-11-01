@@ -1996,8 +1996,23 @@ async fn relay_apply_envelope(units: Vec<serde_json::Value>, want_aggregate: &st
     if !want_aggregate.is_empty() && want_aggregate != aggregate {
         bail!("信封聚合指纹不符：期望 {want_aggregate}，收到 {aggregate}");
     }
-    if !realm_bin().is_file() {
-        bail!("Realm 尚未安装");
+    // 二进制必须是带 api 子命令的 fork 构建：版本不含 REALM_API_VERSION
+    // （机器上残留旧官方版）就自装钉死版本——只查 is_file() 会把旧版当
+    // 新版，unit 起不来循环失败。
+    if realm_bin().is_file() {
+        let v = tokio::process::Command::new(realm_bin())
+            .arg("--version")
+            .output()
+            .await
+            .ok()
+            .map(|o| String::from_utf8_lossy(&o.stdout).to_string())
+            .unwrap_or_default();
+        if !v.contains(REALM_API_VERSION) {
+            eprintln!("[proxy] realm 二进制非 API 构建（{v}），自装 {REALM_API_VERSION}");
+            relay_install(None).await?;
+        }
+    } else {
+        relay_install(None).await?;
     }
 
     let key = ensure_realm_api_unit().await?;
