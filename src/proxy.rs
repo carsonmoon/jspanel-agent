@@ -143,13 +143,27 @@ pub async fn hash_frame() -> Message {
 /// 每 unit 的 {sha256, active} 快照：指纹读盘上 <unit>/realm.toml.hash，
 /// active 走 unit_active（systemd 退出码判活 / dev 子进程槽）。
 async fn realm_units_snapshot() -> serde_json::Value {
+    let applied = realm_applied();
     let mut map = serde_json::Map::new();
-    for id in realm_unit_ids_on_disk() {
-        let sha = std::fs::read_to_string(realm_unit_dir(&id).join("realm.toml.hash"))
-            .map(|s| s.trim().to_owned())
-            .unwrap_or_default();
-        let active = realm_unit_active(&id).await;
-        map.insert(id, serde_json::json!({ "sha256": sha, "active": active }));
+    // active 来自 realm HTTP API 的实例状态；进程不在/查询失败 → 全部
+    // inactive（对账的 poke 会把进程拉回来）。sha 照报，不阻塞心跳。
+    let statuses: std::collections::HashMap<String, bool> = {
+        let key =
+            std::fs::read_to_string(realm_api_key_path()).map(|k| k.trim().to_owned()).unwrap_or_default();
+        if key.is_empty() {
+            Default::default()
+        } else {
+            HttpRealmApi { key }
+                .list()
+                .await
+                .map(|v| v.into_iter().map(|(id, _, st)| (id, st.as_str() == Some("Running"))).collect())
+                .unwrap_or_default()
+        }
+    };
+    for (id, sha) in &applied {
+        let sha = sha.as_str().unwrap_or_default().to_owned();
+        let active = statuses.get(id).copied().unwrap_or(false);
+        map.insert(id.clone(), serde_json::json!({ "sha256": sha, "active": active }));
     }
     serde_json::Value::Object(map)
 }
@@ -565,7 +579,20 @@ async fn status() -> serde_json::Value {
     } else {
         String::new()
     };
-    let realm_running = if realm_installed { realm_any_active().await } else { false };
+    let realm_running = if realm_installed {
+        if systemd() {
+            unit_active("monitor-realm-api").await
+        } else {
+            realm_children()
+                .lock()
+                .unwrap()
+                .get_mut("api")
+                .map(|c| c.try_wait().map_or(true, |w| w.is_none()))
+                .unwrap_or(false)
+        }
+    } else {
+        false
+    };
     let gost_installed = gost_bin().is_file();
     serde_json::json!({
         "installed_version": version,
@@ -620,16 +647,16 @@ pub async fn supervisor() {
             // 起不来（典型：端口被孤儿占用）就退避，避免每 2s 空转。
             tokio::time::sleep(Duration::from_secs(5)).await;
         }
-        // Realm 子进程守护（逐 unit）：有配置的 unit 进程不在就重新拉起。
-        for id in realm_unit_ids_on_disk() {
+        // realm-api 子进程守护（dev）：有期望实例且进程不在就重新拉起。
+        if !realm_applied().is_empty() && realm_bin().is_file() {
             let dead = !realm_children()
                 .lock()
                 .unwrap()
-                .get_mut(&id)
+                .get_mut("api")
                 .map(|c| c.try_wait().map_or(true, |w| w.is_none()))
                 .unwrap_or(false);
-            if dead && spawn_realm_child_unit(&id).is_err() {
-                // 起不来（典型：端口被占）就退避，避免每 2s 空转。
+            if dead && spawn_realm_api_child().await.is_err() {
+                // 起不来就退避，避免每 2s 空转。
                 tokio::time::sleep(Duration::from_secs(5)).await;
             }
         }
@@ -1239,38 +1266,29 @@ async fn relay_install(version: Option<String>) -> Result<String> {
 /// 只确保 realm 单元在跑，不碰配置文件（ensure_started poke 的落点）。
 /// 逐 unit：盘上每个有指纹文件的 unit 都确保 active（幂等——已在跑的不碰）。
 async fn ensure_realm_started() -> Result<()> {
-    for id in realm_unit_ids_on_disk() {
-        if !realm_unit_active(&id).await {
-            restart_realm_unit(&id).await;
-        }
+    if realm_applied().is_empty() {
+        return Ok(());
     }
-    Ok(())
-}
-
-/// systemd 单元是否在跑（unit_active 是全文件唯一 is-active 调用点，退出码
-/// 判活）；非 systemd 环境查子进程槽（try_wait 判死语义与 supervisor 同）。
-async fn realm_unit_active(id: &str) -> bool {
-    if systemd() {
-        unit_active(&format!("monitor-realm@{id}")).await
+    let active = if systemd() {
+        unit_active("monitor-realm-api").await
     } else {
         realm_children()
             .lock()
             .unwrap()
-            .get_mut(id)
+            .get_mut("api")
             .map(|c| c.try_wait().map_or(true, |w| w.is_none()))
             .unwrap_or(false)
+    };
+    if active {
+        return Ok(());
     }
-}
-
-/// 任意一个 unit 在跑就算 realm 在跑（旧口径是 main 一个；unit 化后机器级
-/// 运行态 = 存在任一 active unit）。
-async fn realm_any_active() -> bool {
-    for id in realm_unit_ids_on_disk() {
-        if realm_unit_active(&id).await {
-            return true;
-        }
+    if systemd() {
+        let _ = run_cmd("systemctl", &["start", "monitor-realm-api"]).await;
+        eprintln!("[proxy] realm-api unit poked back up");
+    } else {
+        spawn_realm_api_child().await?;
     }
-    false
+    Ok(())
 }
 
 /// 重启（或首次拉起）单个 realm 单元；非 systemd 环境回落到直接 spawn 子进程。
@@ -1781,10 +1799,13 @@ impl RealmApi for HttpRealmApi {
 /// (id, config Value, sha)。config 以 serde_json::Value 相等判（键序无关）；
 /// actual 的 status 非 Running 且 config 一致 → start（Failed 残留句柄由
 /// fork 补丁在重生前 abort）。
+type InstanceDiff =
+    (Vec<(String, serde_json::Value)>, Vec<(String, serde_json::Value)>, Vec<String>, Vec<String>);
+
 fn plan_instance_diff(
     desired: &[(String, serde_json::Value, String)],
     actual: &[(String, serde_json::Value, serde_json::Value)],
-) -> (Vec<(String, serde_json::Value)>, Vec<(String, serde_json::Value)>, Vec<String>, Vec<String>) {
+) -> InstanceDiff {
     let actual_map: std::collections::BTreeMap<&str, &serde_json::Value> =
         actual.iter().map(|(id, cfg, _)| (id.as_str(), cfg)).collect();
     let status_of = |id: &str| -> Option<&serde_json::Value> {
@@ -1878,6 +1899,29 @@ async fn ensure_realm_api_unit() -> Result<String> {
     Ok(key)
 }
 
+/// dev 环境拉起 realm api 子进程（key/store 从盘上配置读）。
+async fn spawn_realm_api_child() -> Result<()> {
+    let key = std::fs::read_to_string(realm_api_key_path()).map(|k| k.trim().to_owned()).unwrap_or_default();
+    let old = realm_children().lock().unwrap().remove("api");
+    if let Some(mut c) = old {
+        let _ = c.kill().await;
+    }
+    let child = tokio::process::Command::new(realm_bin())
+        .arg("api")
+        .arg("--port")
+        .arg(realm_api_port().to_string())
+        .env("REALM_API_KEY", key)
+        .env("REALM_INSTANCE_STORE", realm_api_store_path())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .kill_on_drop(true)
+        .spawn()
+        .context("无法启动 realm api")?;
+    realm_children().lock().unwrap().insert("api".into(), child);
+    eprintln!("[proxy] realm api child started");
+    Ok(())
+}
+
 /// 拉起 realm-api 进程并等 API 就绪（首次 apply 必须可连）。
 async fn ensure_realm_api_running(key: &str) -> Result<()> {
     if systemd() {
@@ -1893,23 +1937,7 @@ async fn ensure_realm_api_running(key: &str) -> Result<()> {
             .map(|c| c.try_wait().map_or(true, |w| w.is_none()))
             .unwrap_or(false);
         if !alive {
-            let old = realm_children().lock().unwrap().remove("api");
-            if let Some(mut c) = old {
-                let _ = c.kill().await;
-            }
-            let child = tokio::process::Command::new(realm_bin())
-                .arg("api")
-                .arg("--port")
-                .arg(realm_api_port().to_string())
-                .env("REALM_API_KEY", key)
-                .env("REALM_INSTANCE_STORE", &realm_api_store_path())
-                .stdout(std::process::Stdio::null())
-                .stderr(std::process::Stdio::null())
-                .kill_on_drop(true)
-                .spawn()
-                .context("无法启动 realm api")?;
-            realm_children().lock().unwrap().insert("api".into(), child);
-            eprintln!("[proxy] realm api child started");
+            spawn_realm_api_child().await?;
         }
     }
     let probe = HttpRealmApi { key: key.to_owned() };
@@ -2346,8 +2374,6 @@ mod tests {
         std::env::remove_var("MONITOR_PROXY_DIR");
         let _ = std::fs::remove_dir_all(&dir);
     }
-
-    /// 幂等短路（076b242 纪律）：指纹相同且运行态一致的二次 apply 不重写
 
     /// gost 空配置与 relay 同款语义：空体+true 是协议错误且不碰盘；
     /// 空体+false 停服清文件。
