@@ -1119,7 +1119,11 @@ fn push_varint(out: &mut Vec<u8>, mut v: u64) {
 
 // ---- Realm 中转（M5）----
 
-pub const REALM_REPO: &str = "zhboner/realm";
+/// realm-api（PR #160 monitor fork）构建的发布仓与钉死版本。本仓同时挂着
+/// agent 的 v1.x tag，releases/latest 会挑错——realm 固定取此 tag，升级 =
+/// 改这里 + 推新 realm-api-v* tag（CI 自动构建发布，见 realm-api/）。
+pub const REALM_REPO: &str = "carsonmoon/jspanel-agent";
+pub const REALM_API_VERSION: &str = "2.9.8-m1";
 
 fn realm_bin() -> PathBuf {
     base_dir().join("bin").join("realm")
@@ -1172,28 +1176,20 @@ fn realm_children() -> &'static Mutex<std::collections::BTreeMap<String, tokio::
 }
 
 async fn relay_install(version: Option<String>) -> Result<String> {
+    // 版本固定取 REALM_API_VERSION（fork 构建带 -m1 后缀，故校验放行连字符）；
+    // 本仓混 tag，releases/latest 语义不可用。
     let version = match version {
         Some(v) => {
             let v = v.trim().trim_start_matches('v').to_owned();
-            if v.is_empty() || !v.chars().all(|c| c.is_ascii_digit() || c == '.') {
+            let ok = !v.is_empty()
+                && v.len() <= 32
+                && v.chars().all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '-');
+            if !ok {
                 bail!("版本号格式不对：{v}");
             }
             v
         }
-        None => {
-            let client = reqwest::Client::builder().timeout(Duration::from_secs(30)).build()?;
-            let v: serde_json::Value = client
-                .get(format!("https://api.github.com/repos/{REALM_REPO}/releases/latest"))
-                .header("User-Agent", "monitor-agent")
-                .send()
-                .await
-                .context("无法访问 GitHub")?
-                .error_for_status()?
-                .json()
-                .await
-                .context("解析 GitHub 响应失败")?;
-            v["tag_name"].as_str().unwrap_or_default().trim_start_matches('v').to_owned()
-        }
+        None => REALM_API_VERSION.to_owned(),
     };
     let target = match (std::env::consts::OS, std::env::consts::ARCH) {
         ("linux", "x86_64") => "x86_64-unknown-linux-musl",
@@ -1624,13 +1620,17 @@ async fn relay_apply(body: String, desired_running: bool, hash: &str) -> Result<
     Ok(())
 }
 
-// ---- relay.apply 信封（机器级多 unit）----
+// ---- relay.apply 信封（realm-api 单进程 + 进程内多实例）----
 //
-// 报文：{"units":[{"id","config","sha256"}...], "sha256"}。id 是规则 id 或
-// 占位 "main"。agent 逐 unit diff：指纹相同且 active 的不动，其余写盘+
-// restart；期望集外的现存 unit 停止并清目录（删规则/规则换机/老 main 退役
-// 都由这条统一收口）。机器级聚合指纹落盘 envelope.hash，心跳以它对账——
-// 口径与 hub 侧同一定义，两仓各有一份同向量 golden 测试锁死。
+// 报文：{"units":[{"id","config","sha256"}...], "sha256"}。id = 规则 id、
+// "<规则id>-exit"（隧道出口半边）或占位 "main"；config 是 EndpointConf 的
+// **JSON 字符串**（hub 端 canonical 序列化，sha256 对该字符串算——agent 校验
+// 后原样转发给 realm 的 HTTP API，字段序不经过中间人）。执行器不再是
+// 「写文件+systemd 逐单元重启」，而是对 realm 进程内实例做 GET 对比 →
+// POST/PUT/DELETE/start——改/停/删单条规则不重启任何进程，其他实例的
+// 连接零感知（PR #160 的单进程模型，2026-11-01 拍板替换逐 unit 多进程）。
+// 机器级聚合指纹 units_aggregate 落盘 envelope.hash，心跳以它对账——口径
+// 与 hub 侧同一定义，两仓 golden 测试锁死。
 
 /// 机器级聚合指纹：unit 按 id 升序，拼接 "id\nsha256\n" 后取 sha256。
 /// 空清单 = sha256("")。与 hub 侧（monitor/src/proxy.rs units_aggregate）
@@ -1648,8 +1648,173 @@ fn units_aggregate(units: &[(&str, &str)]) -> String {
     hex(&Sha256::digest(buf.as_bytes()))
 }
 
-/// systemd 模板单元：ExecStart 走 %i（instances/<unit>/realm.toml）。对旧
-/// main 实例零影响（%i=main 与旧硬编码路径同址）。内容有变才写+daemon-reload。
+/// API 端口恒回环（fork 补丁也在服务端钉死了 127.0.0.1，双保险）。
+fn realm_api_port() -> u16 {
+    18080
+}
+
+fn realm_api_key_path() -> PathBuf {
+    realm_instances_dir().join("realm-api.key")
+}
+
+fn realm_api_store_path() -> PathBuf {
+    realm_instances_dir().join("realm-api.json")
+}
+
+fn realm_api_conf_path() -> PathBuf {
+    realm_instances_dir().join("realm-api.conf.json")
+}
+
+/// 最后成功 apply 的期望清单（id → sha256）落点。
+fn realm_applied_path() -> PathBuf {
+    realm_instances_dir().join("realm-api.applied.json")
+}
+
+/// 最后一次成功 apply 的期望清单（id → sha256）：心跳徽标数据源 + 「进程该
+/// 不该在跑」的判据（空清单 = 运维显式停服/无腿，poke 不拉活）。
+fn realm_applied() -> serde_json::Map<String, serde_json::Value> {
+    serde_json::from_str(&std::fs::read_to_string(realm_applied_path()).unwrap_or_default())
+        .unwrap_or_default()
+}
+
+fn realm_applied_write(map: &serde_json::Map<String, serde_json::Value>) -> Result<()> {
+    std::fs::create_dir_all(realm_instances_dir())?;
+    std::fs::write(realm_applied_path(), serde_json::to_string_pretty(map)?)?;
+    Ok(())
+}
+
+fn random_hex32() -> String {
+    use std::io::Read;
+    let mut b = [0u8; 32];
+    std::fs::File::open("/dev/urandom").and_then(|mut f| f.read_exact(&mut b)).expect("无法读 /dev/urandom");
+    hex(&b)
+}
+
+/// realm 实例 API 的抽象：HTTP 实现打回环，测试用内存桩。
+trait RealmApi {
+    /// (id, config Value, status Value)。status 是字符串 "Running"/"Stopped"
+    /// 或 {"Failed": "..."}（外部标签枚举）。
+    async fn list(&self) -> Result<Vec<(String, serde_json::Value, serde_json::Value)>>;
+    async fn create(&self, id: &str, config: &serde_json::Value) -> Result<()>;
+    async fn update(&self, id: &str, config: &serde_json::Value) -> Result<()>;
+    async fn delete(&self, id: &str) -> Result<()>;
+    async fn start(&self, id: &str) -> Result<()>;
+}
+
+struct HttpRealmApi {
+    key: String,
+}
+
+impl RealmApi for HttpRealmApi {
+    async fn list(&self) -> Result<Vec<(String, serde_json::Value, serde_json::Value)>> {
+        let client = reqwest::Client::builder().timeout(Duration::from_secs(5)).build()?;
+        let v: serde_json::Value = client
+            .get(format!("http://127.0.0.1:{}/instances", realm_api_port()))
+            .header("X-API-Key", &self.key)
+            .send()
+            .await?
+            .error_for_status()?
+            .json()
+            .await?;
+        Ok(v.as_array()
+            .map(|a| {
+                a.iter()
+                    .filter_map(|i| {
+                        Some((
+                            i["id"].as_str()?.to_owned(),
+                            i.get("config").cloned().unwrap_or_default(),
+                            i.get("status").cloned().unwrap_or_default(),
+                        ))
+                    })
+                    .collect()
+            })
+            .unwrap_or_default())
+    }
+    async fn create(&self, id: &str, config: &serde_json::Value) -> Result<()> {
+        let mut body = config.clone();
+        body["id"] = serde_json::json!(id);
+        let client = reqwest::Client::builder().timeout(Duration::from_secs(5)).build()?;
+        let r = client
+            .post(format!("http://127.0.0.1:{}/instances", realm_api_port()))
+            .header("X-API-Key", &self.key)
+            .json(&body)
+            .send()
+            .await?
+            .error_for_status()?;
+        let _ = r;
+        Ok(())
+    }
+    async fn update(&self, id: &str, config: &serde_json::Value) -> Result<()> {
+        let client = reqwest::Client::builder().timeout(Duration::from_secs(5)).build()?;
+        client
+            .put(format!("http://127.0.0.1:{}/instances/{id}", realm_api_port()))
+            .header("X-API-Key", &self.key)
+            .json(config)
+            .send()
+            .await?
+            .error_for_status()?;
+        Ok(())
+    }
+    async fn delete(&self, id: &str) -> Result<()> {
+        let client = reqwest::Client::builder().timeout(Duration::from_secs(5)).build()?;
+        client
+            .delete(format!("http://127.0.0.1:{}/instances/{id}", realm_api_port()))
+            .header("X-API-Key", &self.key)
+            .send()
+            .await?
+            .error_for_status()?;
+        Ok(())
+    }
+    async fn start(&self, id: &str) -> Result<()> {
+        let client = reqwest::Client::builder().timeout(Duration::from_secs(5)).build()?;
+        client
+            .post(format!("http://127.0.0.1:{}/instances/{id}/start", realm_api_port()))
+            .header("X-API-Key", &self.key)
+            .send()
+            .await?
+            .error_for_status()?;
+        Ok(())
+    }
+}
+
+/// 纯函数 diff（对账核心，单测锁语义）：desired/actual 均为
+/// (id, config Value, sha)。config 以 serde_json::Value 相等判（键序无关）；
+/// actual 的 status 非 Running 且 config 一致 → start（Failed 残留句柄由
+/// fork 补丁在重生前 abort）。
+fn plan_instance_diff(
+    desired: &[(String, serde_json::Value, String)],
+    actual: &[(String, serde_json::Value, serde_json::Value)],
+) -> (Vec<(String, serde_json::Value)>, Vec<(String, serde_json::Value)>, Vec<String>, Vec<String>) {
+    let actual_map: std::collections::BTreeMap<&str, &serde_json::Value> =
+        actual.iter().map(|(id, cfg, _)| (id.as_str(), cfg)).collect();
+    let status_of = |id: &str| -> Option<&serde_json::Value> {
+        actual.iter().find(|(aid, _, _)| aid == id).map(|(_, _, st)| st)
+    };
+    let mut create = Vec::new();
+    let mut update = Vec::new();
+    let mut start = Vec::new();
+    for (id, cfg, _sha) in desired {
+        match actual_map.get(id.as_str()) {
+            None => create.push((id.clone(), cfg.clone())),
+            Some(have) if have == &cfg => {
+                if status_of(id).map(|s| s.as_str() != Some("Running")).unwrap_or(true) {
+                    start.push(id.clone());
+                }
+            }
+            Some(_) => update.push((id.clone(), cfg.clone())),
+        }
+    }
+    let delete: Vec<String> = actual
+        .iter()
+        .filter(|(id, _, _)| !desired.iter().any(|(did, _, _)| did == id))
+        .map(|(id, _, _)| id.clone())
+        .collect();
+    (create, update, start, delete)
+}
+
+/// 旧协议（整份 toml→monitor-realm@main）的模板单元：ExecStart 走 %i。内容
+/// 有变才写+daemon-reload。仅旧 hub 兼容期使用；新 hub 的信封 apply 会退役
+/// 整个模板（retire_legacy_realm_units）。
 async fn ensure_realm_template() {
     if !systemd() {
         return;
@@ -1675,69 +1840,178 @@ async fn ensure_realm_template() {
     eprintln!("[proxy] realm unit template updated (%i)");
 }
 
-/// 机器级信封 apply：先整包校验（id 形态/逐 unit 指纹/聚合指纹），再逐 unit
-/// diff 动盘。任何一步失败都不半途而废——对账心跳 60s 后重推整包。
+/// systemd 单元（monitor-realm-api）+ API key + 全局配置，内容幂等写。
+/// 全局 network 留空：realm 自带 tcp+udp 默认，实例的 network 覆盖由 hub
+/// 渲染时显式给出——不留 take_field 合并的口径分叉。
+async fn ensure_realm_api_unit() -> Result<String> {
+    let key_path = realm_api_key_path();
+    let key = match std::fs::read_to_string(&key_path) {
+        Ok(k) if k.trim().len() >= 32 => k.trim().to_owned(),
+        _ => {
+            let k = random_hex32();
+            std::fs::create_dir_all(realm_instances_dir())?;
+            std::fs::write(&key_path, &k)?;
+            k
+        }
+    };
+    let conf = r#"{"log":{"level":"warn"},"network":{}}"#;
+    std::fs::write(realm_api_conf_path(), conf)?;
+    if systemd() {
+        let unit = format!(
+            "[Unit]\nDescription=monitor realm-api (instance HTTP API)\nAfter=network-online.target\n\n[Service]\nType=simple\nEnvironment=REALM_API_KEY={key}\nEnvironment=REALM_INSTANCE_STORE={}\nExecStart={} api --port {} -c {}\nRestart=always\nRestartSec=3\n\n[Install]\nWantedBy=multi-user.target\n",
+            realm_api_store_path().display(),
+            realm_bin().display(),
+            realm_api_port(),
+            realm_api_conf_path().display(),
+        );
+        let path = Path::new("/etc/systemd/system/monitor-realm-api.service");
+        let needs = match std::fs::read_to_string(path) {
+            Ok(old) => old != unit,
+            Err(_) => true,
+        };
+        if needs {
+            std::fs::write(path, &unit)?;
+            let _ = run_cmd("systemctl", &["daemon-reload"]).await;
+            eprintln!("[proxy] monitor-realm-api unit written");
+        }
+    }
+    Ok(key)
+}
+
+/// 拉起 realm-api 进程并等 API 就绪（首次 apply 必须可连）。
+async fn ensure_realm_api_running(key: &str) -> Result<()> {
+    if systemd() {
+        if !unit_active("monitor-realm-api").await {
+            run_cmd("systemctl", &["restart", "monitor-realm-api"]).await?;
+            eprintln!("[proxy] realm-api unit started");
+        }
+    } else {
+        let alive = realm_children()
+            .lock()
+            .unwrap()
+            .get_mut("api")
+            .map(|c| c.try_wait().map_or(true, |w| w.is_none()))
+            .unwrap_or(false);
+        if !alive {
+            let old = realm_children().lock().unwrap().remove("api");
+            if let Some(mut c) = old {
+                let _ = c.kill().await;
+            }
+            let child = tokio::process::Command::new(realm_bin())
+                .arg("api")
+                .arg("--port")
+                .arg(realm_api_port().to_string())
+                .env("REALM_API_KEY", key)
+                .env("REALM_INSTANCE_STORE", &realm_api_store_path())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .kill_on_drop(true)
+                .spawn()
+                .context("无法启动 realm api")?;
+            realm_children().lock().unwrap().insert("api".into(), child);
+            eprintln!("[proxy] realm api child started");
+        }
+    }
+    let probe = HttpRealmApi { key: key.to_owned() };
+    for _ in 0..25 {
+        if probe.list().await.is_ok() {
+            return Ok(());
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+    bail!("realm-api 已启动但 API 未就绪（18080）")
+}
+
+/// 旧多进程（monitor-realm@<id>）一次性退役：停所有实例单元、删模板与
+/// realm 配置文件（instances/<id>/ 与 sing-box 共住，只删 realm 的两份文件，
+/// 目录空了顺手摘——2026-11-01 整目录 rm 事故的规矩）。幂等：模板不在即跳过。
+async fn retire_legacy_realm_units() {
+    if !Path::new("/etc/systemd/system/monitor-realm@.service").exists() {
+        return;
+    }
+    for id in realm_unit_ids_on_disk() {
+        let _ = run_cmd("systemctl", &["stop", &format!("monitor-realm@{id}")]).await;
+        let dir = realm_unit_dir(&id);
+        let _ = std::fs::remove_file(dir.join("realm.toml"));
+        let _ = std::fs::remove_file(dir.join("realm.toml.hash"));
+        let _ = std::fs::remove_dir(&dir);
+    }
+    let _ = std::fs::remove_file("/etc/systemd/system/monitor-realm@.service");
+    let _ = run_cmd("systemctl", &["daemon-reload"]).await;
+    eprintln!("[proxy] 旧 monitor-realm@* 单元已退役（realm-api 单进程接管）");
+}
+
+/// 机器级信封 apply：整包校验 → 退役旧多进程 → 确保 realm-api 进程在跑 →
+/// GET 对比 → 执行 diff → 落盘 applied 清单与聚合指纹。任何一步失败都不半
+/// 途而废——对账心跳 60s 后重推整包。
 async fn relay_apply_envelope(units: Vec<serde_json::Value>, want_aggregate: &str) -> Result<String> {
-    let mut expected: Vec<(String, String, String)> = Vec::new(); // (id, config, sha256)
+    let mut expected: Vec<(String, serde_json::Value, String)> = Vec::new(); // (id, config, sha256)
     for u in &units {
         let id = u["id"].as_str().context("unit 缺少 id")?;
         if !valid_unit_id(id) {
             bail!("非法 unit id：{id}");
         }
-        let cfg = u["config"].as_str().with_context(|| format!("unit {id} 缺少 config"))?.to_owned();
+        // config 是 canonical JSON 字符串（hub 端序列化），sha256 对该串算，
+        // 原样 parse 后转发——字段序不经过中间人。
+        let cfg_str = u["config"].as_str().context("unit {id} 缺少 config")?;
         let want = u["sha256"].as_str().unwrap_or_default();
-        let got = if cfg.is_empty() { String::new() } else { hex(&Sha256::digest(cfg.as_bytes())) };
+        let got = hex(&Sha256::digest(cfg_str.as_bytes()));
         if !want.is_empty() && want != got {
             bail!("unit {id} 配置指纹不符：期望 {want}，收到 {got}");
         }
-        expected.push((id.to_owned(), cfg, got));
+        let cfg: serde_json::Value =
+            serde_json::from_str(cfg_str).with_context(|| format!("unit {id} config 非法 JSON"))?;
+        expected.push((id.to_owned(), cfg, got.to_owned()));
     }
     let refs: Vec<(&str, &str)> = expected.iter().map(|(id, _, sha)| (id.as_str(), sha.as_str())).collect();
     let aggregate = units_aggregate(&refs);
     if !want_aggregate.is_empty() && want_aggregate != aggregate {
         bail!("信封聚合指纹不符：期望 {want_aggregate}，收到 {aggregate}");
     }
+    if !realm_bin().is_file() {
+        bail!("Realm 尚未安装");
+    }
 
-    ensure_realm_template().await;
-    let expected_ids: std::collections::BTreeSet<&str> =
-        expected.iter().map(|(id, _, _)| id.as_str()).collect();
-    // 先清退再启动：期望集外的现存 unit（删规则/规则换机/老 main 退役）先停
-    // 掉放还端口，新 unit 随后启动才能绑上——反过来首次迁移会撞端口，新
-    // unit 起不来要等下一拍 poke 才自愈（60s 空窗）。
-    for id in realm_unit_ids_on_disk() {
-        if !expected_ids.contains(id.as_str()) {
-            eprintln!("[proxy] realm unit {id} 不在期望集：停止并清理");
-            stop_realm_unit(&id).await;
-            // 只删 realm 自己的两份文件，绝不整目录 rm——instances/main 与
-            // sing-box 的 config.json 同住一个目录（同机双核心共用），整目录
-            // 删除是清库级事故（2026-11-01 实锤：195 的 main 连带核心配置
-            // 被删，靠重渲染恢复）。
-            let dir = realm_unit_dir(&id);
-            let _ = std::fs::remove_file(dir.join("realm.toml"));
-            let _ = std::fs::remove_file(dir.join("realm.toml.hash"));
-            // 目录空了顺手摘掉（非递归：还住着别的核心文件时自然失败）。
-            let _ = std::fs::remove_dir(&dir);
-        }
+    let key = ensure_realm_api_unit().await?;
+    retire_legacy_realm_units().await;
+    ensure_realm_api_running(&key).await?;
+
+    let api = HttpRealmApi { key };
+    apply_envelope_via_api(&api, &expected).await?;
+
+    let mut map = serde_json::Map::new();
+    for (id, _, sha) in &expected {
+        map.insert(id.clone(), serde_json::json!(sha));
     }
-    for (id, cfg, sha) in &expected {
-        // 幂等短路（076b242 纪律）：指纹相同且运行态一致直接不动，不重启。
-        let disk_hash = std::fs::read_to_string(realm_unit_dir(id).join("realm.toml.hash"))
-            .map(|s| s.trim().to_owned())
-            .unwrap_or_default();
-        let active = realm_unit_active(id).await;
-        if disk_hash == *sha && active {
-            continue;
-        }
-        let dir = realm_unit_dir(id);
-        tokio::fs::create_dir_all(&dir).await?;
-        tokio::fs::write(dir.join("realm.toml"), cfg).await?;
-        std::fs::write(dir.join("realm.toml.hash"), sha)?;
-        // 指纹变了→restart；没变但没跑→restart 兼 start（inactive restart=start）。
-        restart_realm_unit(id).await;
-    }
-    std::fs::create_dir_all(realm_instances_dir())?;
+    realm_applied_write(&map)?;
     std::fs::write(realm_envelope_hash_path(), &aggregate)?;
     Ok(aggregate)
+}
+
+/// diff 执行（API 注入，测试用内存桩）。操作失败即返回错误——对账重推整包。
+async fn apply_envelope_via_api(
+    api: &impl RealmApi,
+    expected: &[(String, serde_json::Value, String)],
+) -> Result<()> {
+    let actual = api.list().await?;
+    let (create, update, start, delete) = plan_instance_diff(expected, &actual);
+    for (id, cfg) in &create {
+        api.create(id, cfg).await?;
+        eprintln!("[proxy] realm instance {id} created");
+    }
+    for (id, cfg) in &update {
+        api.update(id, cfg).await?;
+        eprintln!("[proxy] realm instance {id} updated");
+    }
+    for id in &start {
+        api.start(id).await?;
+        eprintln!("[proxy] realm instance {id} started");
+    }
+    for id in &delete {
+        api.delete(id).await?;
+        eprintln!("[proxy] realm instance {id} deleted");
+    }
+    Ok(())
 }
 
 /// HTTP 探测（hub 协议测速用）：从本机向 url 发 GET，测到收到响应头的耗时。
@@ -1968,41 +2242,92 @@ mod tests {
     }
 
     /// 信封 apply 落盘与清理：期望 unit 写入 instances/<id>/；期望集外的旧
-    /// main（遗留布局）与孤儿 unit 一并下线清目录；机器级指纹切到信封聚合。
+    /// 实例 diff 语义（内存桩跑真执行器）：新建/收敛零操作/配置变更=update/
+    /// 停止=start/期望外=delete。envelope 落盘簿记在 E2E 验证。
     #[tokio::test]
-    async fn envelope_apply_writes_units_and_cleans_orphans() {
-        let _env = ENV_LOCK.lock().await;
-        let dir = std::env::temp_dir().join(format!("monitor-agent-relay-env-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        std::env::set_var("MONITOR_PROXY_DIR", &dir);
-        // 遗留布局：旧 main + 孤儿 unit 99；期望集只有 17 → 两者都应清理。
-        // main 目录与 sing-box 的 config.json 同住：清退只许动 realm 的两份
-        // 文件（2026-11-01 事故回归：整目录 rm 曾连带删掉核心配置）。
-        std::fs::create_dir_all(realm_unit_dir("main")).unwrap();
-        std::fs::write(realm_config(), "legacy").unwrap();
-        std::fs::write(realm_config().with_extension("toml.hash"), "legacy-hash").unwrap();
-        std::fs::write(realm_unit_dir("main").join("config.json"), "{\"cohabiting\":true}").unwrap();
-        std::fs::create_dir_all(realm_unit_dir("99")).unwrap();
-        std::fs::write(realm_unit_dir("99").join("realm.toml"), "orphan").unwrap();
+    async fn instance_diff_creates_updates_starts_deletes() {
+        let api = MockRealmApi::default();
+        let cfg_a = serde_json::json!({"listen": "0.0.0.0:10001", "remote": "10.0.0.1:80"});
+        let cfg_b = serde_json::json!({"listen": "0.0.0.0:10001", "remote": "10.0.0.2:80"});
+        let desired = |pairs: Vec<(&str, serde_json::Value)>| {
+            pairs
+                .into_iter()
+                .map(|(id, cfg)| {
+                    let sha = hex(&Sha256::digest(cfg.to_string().as_bytes()));
+                    (id.to_owned(), cfg, sha)
+                })
+                .collect::<Vec<_>>()
+        };
 
-        let cfg17 = "[network]\nno_tcp = false\nuse_udp = true\n\n[[endpoints]]\nlisten = \"0.0.0.0:10001\"\nremote = \"10.0.0.1:80\"\n";
-        let sha17 = hex(&Sha256::digest(cfg17.as_bytes()));
-        let units = serde_json::json!([{ "id": "17", "config": cfg17, "sha256": sha17 }]);
-        let want = units_aggregate(&[("17", sha17.as_str())]);
-        let got = relay_apply_envelope(units.as_array().unwrap().clone(), &want).await.unwrap();
-        assert_eq!(got, want);
-        assert_eq!(realm_hash(), want, "机器级指纹应切到信封聚合");
-        assert!(realm_unit_dir("17").join("realm.toml").is_file(), "unit 配置应落盘");
-        assert!(realm_unit_dir("17").join("realm.toml.hash").is_file(), "unit 指纹应落盘");
-        assert!(!realm_unit_dir("main").join("realm.toml").exists(), "清退后 realm 配置文件应清除");
-        assert!(
-            realm_unit_dir("main").join("config.json").is_file(),
-            "同目录的核心配置必须幸存（目录共享，禁整目录 rm）"
+        // ops 跨 apply 累积，断言取每轮增量。
+        macro_rules! apply_and_expect {
+            ($want:expr, $expect:expr, $msg:expr) => {{
+                let n0 = api.ops().len();
+                apply_envelope_via_api(&api, &desired($want)).await.unwrap();
+                assert_eq!(&api.ops()[n0..], $expect, "{}", $msg);
+            }};
+        }
+        let ph = serde_json::json!({"listen": "127.0.0.1:19998", "remote": "127.0.0.1:9"});
+        apply_and_expect!(vec![("17", cfg_a.clone())], &["create:17".to_owned()], "空机首推=创建");
+        apply_and_expect!(vec![("17", cfg_a.clone())], &[] as &[String], "收敛态零操作");
+        apply_and_expect!(vec![("17", cfg_b.clone())], &["update:17".to_owned()], "配置变更=update");
+        apply_and_expect!(
+            vec![("17", cfg_b.clone()), ("main", ph.clone())],
+            &["create:main".to_owned()],
+            "新增实例=创建"
         );
-        assert!(!realm_unit_dir("99").join("realm.toml").exists(), "孤儿 unit 应被清理");
+        apply_and_expect!(vec![("main", ph.clone())], &["delete:17".to_owned()], "期望外实例=删除");
+        api.stop("main");
+        apply_and_expect!(vec![("main", ph)], &["start:main".to_owned()], "配置一致但停止=start");
+    }
 
-        std::env::remove_var("MONITOR_PROXY_DIR");
-        let _ = std::fs::remove_dir_all(&dir);
+    /// realm-api 实例的内存桩：记操作序列、维护 (id, config, status) 表。
+    #[derive(Default)]
+    struct MockRealmApi {
+        items: std::sync::Mutex<Vec<(String, serde_json::Value, serde_json::Value)>>,
+        ops: std::sync::Mutex<Vec<String>>,
+    }
+    impl MockRealmApi {
+        fn ops(&self) -> Vec<String> {
+            self.ops.lock().unwrap().clone()
+        }
+        fn stop(&self, id: &str) {
+            let mut items = self.items.lock().unwrap();
+            if let Some(it) = items.iter_mut().find(|(i, _, _)| i == id) {
+                it.2 = serde_json::json!("Stopped");
+            }
+        }
+    }
+    impl RealmApi for MockRealmApi {
+        async fn list(&self) -> anyhow::Result<Vec<(String, serde_json::Value, serde_json::Value)>> {
+            Ok(self.items.lock().unwrap().clone())
+        }
+        async fn create(&self, id: &str, config: &serde_json::Value) -> anyhow::Result<()> {
+            self.ops.lock().unwrap().push(format!("create:{id}"));
+            self.items.lock().unwrap().push((id.to_owned(), config.clone(), serde_json::json!("Running")));
+            Ok(())
+        }
+        async fn update(&self, id: &str, config: &serde_json::Value) -> anyhow::Result<()> {
+            self.ops.lock().unwrap().push(format!("update:{id}"));
+            let mut items = self.items.lock().unwrap();
+            if let Some(it) = items.iter_mut().find(|(i, _, _)| i == id) {
+                it.1 = config.clone();
+            }
+            Ok(())
+        }
+        async fn delete(&self, id: &str) -> anyhow::Result<()> {
+            self.ops.lock().unwrap().push(format!("delete:{id}"));
+            self.items.lock().unwrap().retain(|(i, _, _)| i != id);
+            Ok(())
+        }
+        async fn start(&self, id: &str) -> anyhow::Result<()> {
+            self.ops.lock().unwrap().push(format!("start:{id}"));
+            let mut items = self.items.lock().unwrap();
+            if let Some(it) = items.iter_mut().find(|(i, _, _)| i == id) {
+                it.2 = serde_json::json!("Running");
+            }
+            Ok(())
+        }
     }
 
     /// 非法 unit id（路径逃逸形态）整包拒绝，盘上零写入。
@@ -2023,45 +2348,6 @@ mod tests {
     }
 
     /// 幂等短路（076b242 纪律）：指纹相同且运行态一致的二次 apply 不重写
-    /// 文件。dev 路径用假 realm 二进制（sleep）让子进程真活着。
-    #[tokio::test]
-    async fn envelope_apply_is_idempotent_when_units_healthy() {
-        let _env = ENV_LOCK.lock().await;
-        let dir = std::env::temp_dir().join(format!("monitor-agent-relay-idem-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        std::env::set_var("MONITOR_PROXY_DIR", &dir);
-        let bin = realm_bin();
-        std::fs::create_dir_all(bin.parent().unwrap()).unwrap();
-        std::fs::write(&bin, "#!/bin/sh\nexec sleep 30\n").unwrap();
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
-        }
-
-        let cfg17 = "[network]\nno_tcp = false\nuse_udp = true\n\n[[endpoints]]\nlisten = \"0.0.0.0:10002\"\nremote = \"10.0.0.2:80\"\n";
-        let sha17 = hex(&Sha256::digest(cfg17.as_bytes()));
-        let units = serde_json::json!([{ "id": "17", "config": cfg17, "sha256": sha17 }]);
-        let want = units_aggregate(&[("17", sha17.as_str())]);
-        relay_apply_envelope(units.as_array().unwrap().clone(), &want).await.unwrap();
-        let path = realm_unit_dir("17").join("realm.toml");
-        let mtime1 = std::fs::metadata(&path).unwrap().modified().unwrap();
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-        relay_apply_envelope(units.as_array().unwrap().clone(), &want).await.unwrap();
-        let mtime2 = std::fs::metadata(&path).unwrap().modified().unwrap();
-        assert_eq!(mtime1, mtime2, "收敛态二次 apply 不应重写文件");
-
-        // 先取走再杀：MutexGuard 不能跨 await（await_holding_lock=deny）。
-        let kids: Vec<_> = {
-            let mut slot = realm_children().lock().unwrap();
-            std::mem::take(&mut *slot).into_iter().collect()
-        };
-        for (_, mut c) in kids {
-            let _ = c.kill().await;
-        }
-        std::env::remove_var("MONITOR_PROXY_DIR");
-        let _ = std::fs::remove_dir_all(&dir);
-    }
 
     /// gost 空配置与 relay 同款语义：空体+true 是协议错误且不碰盘；
     /// 空体+false 停服清文件。
