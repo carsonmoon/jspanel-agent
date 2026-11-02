@@ -51,6 +51,21 @@ pub async fn replay() {
     }
 }
 
+/// root 挂 HTB：qdisc replace 不是幂等操作——HTB 已在 root 上时再 replace
+/// 内核报「Change operation not supported」（生产 one 实锤），所以已挂就
+/// 跳过；class/filter 的 replace 才有真幂等语义。default 99 恒定，重挂
+/// 没有可变参数。（与 hub 仓 src/shaper.rs 同名同语义，两仓不共享代码是
+/// 本仓库既有形态，改一处必须同步另一处。）
+fn ensure_htb(nic: &str, handle: &str) -> Result<()> {
+    let out = Command::new("tc").args(["qdisc", "show", "dev", nic]).output()?;
+    let text = String::from_utf8_lossy(&out.stdout);
+    let wanted = format!("htb {handle}:");
+    if text.contains(&wanted) {
+        return Ok(());
+    }
+    tc(&["qdisc", "replace", "dev", nic, "root", "handle", &format!("{handle}:"), "htb", "default", "99"])
+}
+
 fn tc(args: &[&str]) -> Result<()> {
     let out = Command::new("tc")
         .args(args)
@@ -135,7 +150,8 @@ fn build(nic: &str, ports: &[ShapedPort]) -> Result<()> {
     }
     ip(&["link", "set", IFB, "up"])?;
 
-    tc(&["qdisc", "replace", "dev", nic, "root", "handle", "1:", "htb", "default", "99"])?;
+    // 下载方向：出口网卡 root HTB，default 99 让未托管流量不受影响。
+    ensure_htb(nic, "1")?;
     tc(&[
         "class",
         "replace",
@@ -166,7 +182,8 @@ fn build(nic: &str, ports: &[ShapedPort]) -> Result<()> {
         "ceil",
         PARENT_RATE,
     ])?;
-    tc(&["qdisc", "replace", "dev", IFB, "root", "handle", "2:", "htb", "default", "99"])?;
+    // 上传方向：IFB 上的第二棵 HTB。
+    ensure_htb(IFB, "2")?;
     tc(&[
         "class",
         "replace",

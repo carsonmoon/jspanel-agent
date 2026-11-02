@@ -21,8 +21,10 @@ use super::{run_cmd, systemd, unit_active};
 /// jspp/monitor 与 jspp/monitor-agent 同级布局下成立）。
 pub(super) const GOST_VERSION: &str = "3.3.2";
 const GOST_REPO: &str = "go-gost/gost";
-/// gost API 服务地址：渲染出的配置固定开在这里（仅环回），热重载打它。
-const GOST_API: &str = "http://127.0.0.1:18080/config/reload";
+/// gost API 服务地址：hub 渲染的配置固定开在这里（仅环回），热重载打它。
+/// **18080 被 realm-api 单进程占用**（relay.rs 实例模型），gost 用 18081，
+/// 与 hub 侧 GOST_API_PORT 同值（tests/gost_port_guard.rs 锁死两仓一致）。
+const GOST_API: &str = "http://127.0.0.1:18081/config/reload";
 
 fn gost_bin() -> PathBuf {
     super::singbox::base_dir().join("bin").join("gost")
