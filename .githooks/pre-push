@@ -1,0 +1,11 @@
+#!/bin/sh
+# pre-push 快速门禁（retro 2026-11-02）：fmt/clippy 类错误此前漏到 deploy 阶段
+# 才被拦（本批连拦 4 次），推送前先在本机跑一遍，左移拦截点。完整门禁
+# （含 cargo test + actionlint + docker 构建）仍在 deploy.sh / CI。
+set -e
+cd "$(git rev-parse --show-toplevel)"
+echo "pre-push: cargo fmt --check..."
+cargo fmt --all --check
+echo "pre-push: cargo clippy -D warnings..."
+cargo clippy -q --all-targets -- -D warnings
+echo "pre-push: ✓"
