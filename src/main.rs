@@ -155,6 +155,38 @@ fn notify(method: &str, params: serde_json::Value) -> Message {
     )
 }
 
+/// hub→agent 请求的分发路由：白名单即分发，单一事实源。
+///
+/// 方法族前缀在此一处收口——新增方法族 = 在 [`Route`] 加一臂 + handler 侧
+/// 挂上，main.rs 的 select 循环只调本函数。历史上 starts_with 链散在分发
+/// 处、漏放行即静默丢帧（net.* / gost.* / shaper.* 三例同款事故），deny
+/// 回帧后同类遗漏从「hub 30s 超时无头案」变「agent 秒级回 UNKNOWN_METHOD」。
+///
+/// `shaper.` 的 handler 挂在 [`proxy::run`]（限速无独立 dispatch 外壳），
+/// 复用 proxy::dispatch 的 spawn+回帧路径。
+fn route(method: &str) -> Handler {
+    match method {
+        m if m.starts_with("proxy.")
+            || m.starts_with("relay.")
+            || m.starts_with("net.")
+            || m.starts_with("gost.")
+            || m.starts_with("shaper.") =>
+        {
+            Handler::Proxy
+        }
+        m if m.starts_with("route.") => Handler::RouteProbe,
+        m if m.starts_with("exec.") => Handler::Exec,
+        _ => Handler::Unknown,
+    }
+}
+
+enum Handler {
+    Proxy,
+    RouteProbe,
+    Exec,
+    Unknown,
+}
+
 /// Writes under a deadline drawn from the remaining silence budget.
 ///
 /// Reads and writes share one `select!` loop, so a socket that never drains
@@ -428,26 +460,38 @@ async fn session(
                                     respawn_ping_tasks(&mut ping_tasks, tasks, &result_tx);
                                 }
                             }
-                            // net.*：net.http_probe（出口测速/出口链诊断，net. 前缀
-                            // 此前不在白名单里被静默丢弃，远程探测从未真正执行）。
-                            // gost.*：隧道模块同款教训——白名单漏前缀=静默丢帧。
-                            Some(m) if m.starts_with("proxy.") || m.starts_with("relay.") || m.starts_with("net.") || m.starts_with("gost.") => {
-                                let params = v.get("params").cloned().unwrap_or_default();
-                                proxy::dispatch(m.to_owned(), params, id, &result_tx);
-                            }
-                            // route.*：回程线路探测（四期），traceroute 阻塞跑在
-                            // spawn_blocking 里，不堵心跳。
-                            Some(m) if m.starts_with("route.") => {
-                                let params = v.get("params").cloned().unwrap_or_default();
-                                route::dispatch(m.to_owned(), params, id, &result_tx);
-                            }
-                            // exec.*：MCP 远程命令执行（五期），hub 侧有租约鉴权
-                            // 与操作审计，开关也在 hub。
-                            Some(m) if m.starts_with("exec.") => {
-                                let params = v.get("params").cloned().unwrap_or_default();
-                                exec::dispatch(m.to_owned(), params, id, &result_tx);
-                            }
-                            Some(_) => {}
+                            // 白名单即分发（route() 单一事实源）：前缀放行 +
+                            // 模块路由在同一处收口，漏放行不再可能静默——
+                            // 未知方法回 error 帧，hub 秒级可见。
+                            Some(m) => match route(m) {
+                                Handler::Proxy => {
+                                    let params = v.get("params").cloned().unwrap_or_default();
+                                    proxy::dispatch(m.to_owned(), params, id, &result_tx);
+                                }
+                                Handler::RouteProbe => {
+                                    let params = v.get("params").cloned().unwrap_or_default();
+                                    route::dispatch(m.to_owned(), params, id, &result_tx);
+                                }
+                                Handler::Exec => {
+                                    let params = v.get("params").cloned().unwrap_or_default();
+                                    exec::dispatch(m.to_owned(), params, id, &result_tx);
+                                }
+                                // deny 回帧：带 id 的请求必须有回应，否则 hub
+                                // 等满超时（shaper.* 曾因此查无此帧，net./gost.
+                                // 同款事故）。无 id 的通知无处回帧，记日志即可。
+                                Handler::Unknown => {
+                                    eprintln!("[dispatch] 未知方法 {m}");
+                                    if let Some(id) = id {
+                                        let frame = serde_json::json!({
+                                            "jsonrpc": "2.0", "id": id,
+                                            "error": {"code": "UNKNOWN_METHOD", "message": format!("未知方法 {m}")},
+                                        });
+                                        if let Err(e) = send(&mut ws, Message::Text(frame.to_string().into()), remaining(last_frame)).await {
+                                            break Err(e);
+                                        }
+                                    }
+                                }
+                            },
                         }
                     }
                 }
@@ -909,5 +953,35 @@ mod tests {
         let flood = (0..500).map(|id| task(id, "f:6", 60)).collect();
         respawn_ping_tasks(&mut running, flood, &tx);
         assert_eq!(running.len(), MAX_PING_TASKS, "the hub does not choose how many probes run");
+    }
+
+    /// 白名单即分发的路由表：hub 侧已知的每个方法族都必须放行到对应模块，
+    /// shaper.* 曾被漏（第三例同款事故，远程限速静默失效）。
+    #[test]
+    fn route_admits_every_method_family_the_hub_sends() {
+        use self::Handler::*;
+        // 每个方法族抽一个真实方法名（与 hub call_agent 发送名逐字一致）。
+        for m in [
+            "proxy.core.install",
+            "proxy.apply_config",
+            "proxy.core.status",
+            "relay.apply",
+            "relay.install",
+            "relay.ensure_started",
+            "gost.apply",
+            "gost.install",
+            "gost.ensure_started",
+            "net.http_probe",
+            "shaper.apply",
+        ] {
+            assert!(matches!(route(m), Proxy), "{m} 必须路由到 proxy::dispatch");
+        }
+        assert!(matches!(route("route.probe"), RouteProbe));
+        assert!(matches!(route("exec.run"), Exec));
+        // 前缀是族不是子串：`shaperish.x` 之类不认。
+        assert!(matches!(route("shapernet.x"), Unknown));
+        // 未知方法走 deny（main.rs 回 UNKNOWN_METHOD 帧），不再静默丢弃。
+        assert!(matches!(route("nope.does_not_exist"), Unknown));
+        assert!(matches!(route(""), Unknown));
     }
 }
